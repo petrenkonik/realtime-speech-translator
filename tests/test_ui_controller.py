@@ -239,9 +239,41 @@ def test_wd6_hide_text_is_live_with_or_without_a_pipeline(
 def test_wd6_the_tts_banner_comes_from_the_wiring(
     wiring: FakeWiring, controller: WindowController
 ) -> None:
-    assert controller.tick().tts_notice == "TTS not installed: outputs are silent"
-    wiring.tts_notice = None
-    assert make(wiring).tick().tts_notice is None
+    # The real wiring has no banner any more (missing voices are problems); the path stays
+    # for any wiring that returns a notice.
+    assert controller.tick().tts_notice is None
+    wiring.tts_notice = "Speech is a placeholder"
+    other = make(wiring)
+    try:
+        assert other.tick().tts_notice == "Speech is a placeholder"
+    finally:
+        other.shutdown()
+
+
+def test_wd16_a_language_change_in_standby_drops_the_voice_name_but_keeps_rate(
+    wiring: FakeWiring,
+) -> None:
+    one_lane = parse_settings(
+        [
+            "--input",
+            "V380",
+            "--targets",
+            "de",
+            "--route",
+            "de=Realtek",
+            "--tts-voice",
+            "de=Hedda",
+            "--tts-rate",
+            "2",
+        ]
+    )
+    controller = make(wiring, one_lane)
+    try:
+        assert controller.set_language("de", "fr")
+        tts = controller.tick().settings.routes[0].tts
+        assert (tts.rate, tts.voice) == (2, None)  # a German voice name never fits French
+    finally:
+        controller.shutdown()
 
 
 # ---------------------------------------------------------------- WD7 connecting and device control

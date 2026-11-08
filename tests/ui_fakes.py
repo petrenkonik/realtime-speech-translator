@@ -6,6 +6,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import replace
 
+import numpy as np
 from fakes import FakeDeviceList, make_device
 from test_ui_model import capture_stats, device, output_stats
 
@@ -14,10 +15,11 @@ from pipeline.bus import Bus, ChunkBus
 from pipeline.capture import CaptureStats
 from pipeline.config import SOURCE_LANGUAGE, SUPPORTED_TARGETS, ConfigError, Settings
 from pipeline.devices import DeviceInfo
-from pipeline.lanes import TranslationBus
+from pipeline.lanes import Speech, TranslationBus
 from pipeline.metrics import Metrics
 from pipeline.output import OutputStats
 from pipeline.transcribe import TextBus
+from pipeline.tts_sapi import VoiceInfo
 from pipeline.ui.controller import BuiltPipeline
 
 MIC = "Microphone (V380 USB)"
@@ -186,10 +188,69 @@ class ControlPipeline:
         }
 
 
+TONE_RATE_HZ = 22_050  # the rate SAPI voices speak at
+
+
+class ToneTts:
+    """A ``TtsEngine`` double: an audible 440 Hz tone at the SAPI rate, 20 ms per character."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.closed = 0
+
+    def synthesize(self, text: str) -> Speech:
+        self.texts.append(text)
+        count = max(1, len(text)) * TONE_RATE_HZ // 50
+        tone = 0.25 * np.sin(2 * np.pi * 440 * np.arange(count) / TONE_RATE_HZ)
+        return Speech(samples=tone.astype(np.float32), rate_hz=TONE_RATE_HZ)
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class FakeVoiceBackend:
+    """A ``VoiceBackend`` double that records the thread it was made, used and closed on."""
+
+    def __init__(self, owner: FakeVoices) -> None:
+        self._owner = owner
+        self._owner.created.append(threading.get_ident())
+
+    def voices(self) -> list[VoiceInfo]:
+        self._owner.listed.append(threading.get_ident())
+        if self._owner.fail is not None:
+            raise self._owner.fail
+        return list(self._owner.installed)
+
+    def speak(self, voice: VoiceInfo, text: str, rate: int, volume: int) -> bytes:
+        raise AssertionError("the voice check must never speak")
+
+    def close(self) -> None:
+        self._owner.closed.append(threading.get_ident())
+
+
+class FakeVoices:
+    """The ``voice_backend`` factory of the wiring: a configurable list of installed voices."""
+
+    def __init__(self, installed: list[VoiceInfo] | None = None) -> None:
+        self.installed = [EN_VOICE, DE_VOICE, FR_VOICE] if installed is None else installed
+        self.fail: Exception | None = None
+        self.created: list[int] = []
+        self.listed: list[int] = []
+        self.closed: list[int] = []
+
+    def __call__(self) -> FakeVoiceBackend:
+        return FakeVoiceBackend(self)
+
+
+EN_VOICE = VoiceInfo("TTS_MS_EN-US_DAVID_11.0", "Microsoft David Desktop", (0x409,))
+DE_VOICE = VoiceInfo("TTS_MS_DE-DE_HEDDA_11.0", "Microsoft Hedda Desktop", (0x407,))
+FR_VOICE = VoiceInfo("TTS_MS_FR-FR_HORTENSE_11.0", "Microsoft Hortense Desktop", (0x40C,))
+
+
 class FakeWiring:
     """Builds ``ControlPipeline`` objects; records what the controller did with them."""
 
-    tts_notice: str | None = "TTS not installed: outputs are silent"
+    tts_notice: str | None = None
 
     def __init__(self) -> None:
         self.listing = FakeDeviceList(UI_DEVICES)

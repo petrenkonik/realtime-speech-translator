@@ -79,7 +79,7 @@ def test_wd12_the_window_runs_a_whole_session_on_a_fake_pipeline(
     # Standby: the window is usable with nothing running and says so in words.
     assert window.input_status_text == "Not connected"
     assert set(window.stage_words().values()) == {"Idle"}
-    assert window.tts_banner_text == "TTS not installed: outputs are silent"
+    assert window.tts_banner_text == ""  # a wiring with no notice shows no banner
     assert window.problem_banner_text == ""
     assert [row.language.get() for row in window.output_rows] == ["de - German", "fr - French"]
     pump(root, window, lambda: MIC in window.input_names, "the device scan")
@@ -203,6 +203,120 @@ def test_wd12_a_missing_model_is_shown_inline_and_the_window_stays_usable(root: 
         window.settings_view.edit("segmenter.silence_ms", "500")
         window.settings_view.apply()  # saving settings still works in standby
         pump(root, window, lambda: "saved" in window.status_text, "the settings notice")
+    finally:
+        window.close()
+
+
+def test_wd16_a_missing_voice_is_shown_inline_like_a_missing_model(root: tk.Tk) -> None:
+    wiring = FakeWiring()
+    wiring.problem_list = ("voice missing: no SAPI voice for language 'de'. Install the pack",)
+    controller = WindowController(chosen(), wiring)
+    window = MainWindow(root, controller, poll_ms=20)
+    try:
+        root.update()
+        assert "no SAPI voice for language 'de'" in window.problem_banner_text
+        assert window.tts_banner_text == ""  # one place for it, not two
+        assert not window.input_button_enabled
+        window.settings_view.edit("segmenter.silence_ms", "500")
+        window.settings_view.apply()  # the other settings still work
+        pump(root, window, lambda: "saved" in window.status_text, "the settings notice")
+    finally:
+        window.close()
+
+
+def test_wd16_a_wiring_notice_still_shows_the_speech_banner(root: tk.Tk) -> None:
+    wiring = FakeWiring()
+    wiring.tts_notice = "Speech is a placeholder"
+    controller = WindowController(chosen(), wiring)
+    window = MainWindow(root, controller, poll_ms=20)
+    try:
+        root.update()
+        assert window.tts_banner_text == "Speech is a placeholder"
+    finally:
+        window.close()
+
+
+def _arrow_labels(widget: tk.Misc) -> list[tk.Misc]:
+    return [child for child in widget.winfo_children() if _text_of(child) == "→"]
+
+
+def _text_of(widget: tk.Misc) -> str:
+    try:
+        return str(widget.cget("text"))
+    except tk.TclError:
+        return ""
+
+
+def test_wd19_the_process_strip_forks_into_parallel_lane_rows(root: tk.Tk) -> None:
+    wiring = FakeWiring()
+    controller = WindowController(chosen(), wiring)
+    window = MainWindow(root, controller, poll_ms=20)
+    try:
+        root.update()
+        # Left part: one row, microphone then recognition.
+        assert [card.shown.title for card in window.common_cards if card.shown] == [
+            "Microphone",
+            "Speech recognition (English)",
+        ]
+        # The lanes sit in one titled group, one row each, in the snapshot's order.
+        group = window.lane_group
+        assert group is not None
+        assert str(group.cget("text")) == "In parallel"
+        rows = window.lane_rows
+        assert [row.target for row in rows] == ["de", "fr"]
+        assert [str(row.frame.winfo_parent()) for row in rows] == [str(group)] * 2
+        assert group.winfo_children() == [row.frame for row in rows]  # nothing between the rows
+        assert [row.label.cget("text") for row in rows] == ["de - German", "fr - French"]
+        assert [row.translate.shown.title for row in rows if row.translate.shown] == [
+            "Translate to German (de)",
+            "Translate to French (fr)",
+        ]
+        assert [row.output.shown.title for row in rows if row.output.shown] == [
+            "Speak / output de",
+            "Speak / output fr",
+        ]
+        # An arrow links translate to speak inside a row; none links one lane to the next.
+        for row in rows:
+            assert [_text_of(w) for w in _arrow_labels(row.frame)] == ["→"]
+            assert str(row.translate.frame.winfo_parent()) == str(row.frame)
+            assert str(row.output.frame.winfo_parent()) == str(row.frame)
+        assert _arrow_labels(group) == []
+        # The connector forks from recognition: one stem, one bar, a branch per lane.
+        fork = window.fork
+        assert fork is not None
+        assert len(fork.find_withtag("stem")) == 1
+        assert len(fork.find_withtag("bar")) == 1
+        assert len(fork.find_withtag("branch")) == 2
+        # Health word and colour stay on every card.
+        words = window.stage_words()
+        assert set(words) == {
+            "input",
+            "transcribe",
+            "translate:de",
+            "output:de",
+            "translate:fr",
+            "output:fr",
+        }
+        assert set(words.values()) == {"Idle"}
+        # Widgets are updated in place: a new tick keeps the same boxes.
+        before = [row.translate.frame for row in rows]
+        window.tick()
+        assert [row.translate.frame for row in window.lane_rows] == before
+    finally:
+        window.close()
+
+
+def test_wd19_one_lane_is_one_row_with_a_straight_connector(root: tk.Tk) -> None:
+    wiring = FakeWiring()
+    settings = parse_settings(["--input", "V380", "--route", "de=Realtek", "--targets", "de"])
+    controller = WindowController(settings, wiring)
+    window = MainWindow(root, controller, poll_ms=20)
+    try:
+        root.update()
+        assert [row.target for row in window.lane_rows] == ["de"]
+        assert window.fork is not None
+        assert len(window.fork.find_withtag("bar")) == 0
+        assert len(window.fork.find_withtag("branch")) == 1
     finally:
         window.close()
 

@@ -6,9 +6,10 @@ from pathlib import Path
 
 import pytest
 from fakes import FakeDeviceList, FakeOutputStream, FakeStreamFactory, make_device
+from ui_fakes import FakeVoices, ToneTts
 
 from pipeline.config import parse_settings
-from pipeline.ui.wiring import RealWiring
+from pipeline.ui.wiring import Loaders, RealWiring
 
 pytestmark = pytest.mark.model
 
@@ -44,6 +45,8 @@ def test_wd11_the_real_wiring_builds_and_starts_on_the_local_models(turn_mode: s
         devices=devices,
         input_stream_factory=FakeStreamFactory(),
         output_stream_factory=FakeStreamFactory(FakeOutputStream),
+        # The models are the point here; voices are Windows language packs (WD17 covers SAPI).
+        loaders=Loaders(tts=lambda settings: lambda target: ToneTts(), voice_backend=FakeVoices()),
     )
     assert wiring.problems(settings) == ()
     built = wiring.build(settings)

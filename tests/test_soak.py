@@ -202,3 +202,36 @@ def test_s1_looped_speech_through_the_cable_under_load() -> None:
     report = soak.run_soak(soak.SoakOptions(minutes=minutes))
     print(soak.format_report(report))
     assert soak.evaluate(report) == []
+
+
+# --- scheduler stalls -----------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_the_jitter_probe_reports_the_worst_delay_and_how_many_were_long() -> None:
+    probe = soak.JitterProbe(long_ms=100.0)
+    for late_ms in (1.0, 3.0, 250.0, 120.0, 2.0):
+        probe.observe(late_ms / 1000.0)
+    assert probe.take() == (250.0, 2)
+
+
+@pytest.mark.unit
+def test_taking_resets_the_probe_but_the_run_keeps_its_overall_worst() -> None:
+    probe = soak.JitterProbe(long_ms=100.0)
+    probe.observe(0.3)
+    probe.take()
+    probe.observe(0.01)
+    assert probe.take() == (10.0, 0)
+    assert probe.worst_ms == pytest.approx(300.0)
+
+
+@pytest.mark.unit
+def test_an_idle_probe_reports_zero() -> None:
+    assert soak.JitterProbe().take() == (0.0, 0)
+
+
+@pytest.mark.unit
+def test_the_report_shows_the_scheduler_stall_without_judging_it() -> None:
+    report = good_report(max_scheduler_stall_ms=1800.0)
+    assert "scheduler stall" in soak.format_report(report)
+    assert soak.evaluate(report) == []

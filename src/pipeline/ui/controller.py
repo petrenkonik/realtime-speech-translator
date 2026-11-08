@@ -423,6 +423,9 @@ class _Pending:
 def _with_language(settings: Settings, old: str, new: str) -> Settings:
     """``settings`` with the lane of ``old`` switched to ``new`` (the device stays).
 
+    The speaking rate and volume stay; a voice name chosen for ``old`` is dropped, because it
+    belongs to that language and would never match one of ``new``.
+
     Raises:
         ConfigError: ``old`` has no lane, or ``new`` is unsupported, the source or taken.
     """
@@ -432,7 +435,9 @@ def _with_language(settings: Settings, old: str, new: str) -> Settings:
         settings,
         targets=tuple(new if target == old else target for target in settings.targets),
         routes=tuple(
-            replace(route, target=new) if route.target == old else route
+            replace(route, target=new, tts=replace(route.tts, voice=None))
+            if route.target == old
+            else route
             for route in settings.routes
         ),
     )

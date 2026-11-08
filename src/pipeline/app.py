@@ -554,7 +554,8 @@ class Pipeline:
                 )
             if new_target in self._slots:
                 raise ConfigError(f"target language {new_target!r} is already used by another lane")
-            route = replace(slot.route, target=new_target)
+            # A voice name belongs to one language; rate and volume carry over.
+            route = replace(slot.route, target=new_target, tts=replace(slot.route.tts, voice=None))
             settings = replace(
                 self._settings,
                 targets=tuple(new_target if t == old_target else t for t in self._settings.targets),

@@ -19,9 +19,10 @@ Windows only, CPU only, fully offline.
 > plus the operator window: `ui/model`, `ui/settings_schema`, `ui/settings_form`, `ui/present`,
 > `ui/controller`, `ui/wiring` (no Tk) and `ui/app_tk`, `ui/transcript_view`, `ui/settings_view`,
 > `ui/tk_widgets` (Tk), started with `python -B -m pipeline gui`. `__main__.py` has only `gui` and
-> `list-devices`; `run` and `soak` are still to be written. **Known gap: the operator window
-> (`ui/wiring.py`) still passes the silent placeholder (`SilentTtsEngine`) instead of
-> `tts_sapi.sapi_tts_factory` and `RateConverter`, and says so in a banner.** The rest of `src/` is created step by step per `docs/SPEC.md` section 11.
+> `list-devices`; `run` and `soak` are still to be written. The operator window
+> (`ui/wiring.py`) speaks with `tts_sapi.sapi_tts_factory` and `RateConverter`; a missing SAPI voice is
+> reported by `RealWiring.problems` like a missing model (audible playback through the window is not yet
+> verified by hand). The rest of `src/` is created step by step per `docs/SPEC.md` section 11.
 
 ## Commands
 

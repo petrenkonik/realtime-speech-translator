@@ -1,9 +1,11 @@
-"""The composition root of the window: loaders, caches, silent speech, strict mode (WD10, WD11)."""
+"""The window's composition root: loaders, caches, speech, voices, strict mode (WD10, WD15, WD16)"""
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,23 +22,18 @@ from fakes import (
     stream_of,
 )
 from test_app import HUGE_WATCHDOG_MS
+from ui_fakes import DE_VOICE, EN_VOICE, FakeVoices, ToneTts
 
-from pipeline.config import VAD_MODEL, Settings, parse_settings
-from pipeline.lanes import Speech
+from pipeline.config import VAD_MODEL, Settings, check_files, parse_settings
+from pipeline.lanes import TtsEngine
+from pipeline.resample import RateConverter
 from pipeline.transcribe import FasterWhisperEngine, TranscribeConfig
 from pipeline.translate import TranslateConfig, translator_model_dir
+from pipeline.tts_sapi import ComVoiceBackend, SapiTts, TtsConfig, VoiceNotFoundError
 from pipeline.turn import DEFAULT_TURN_MODEL
 from pipeline.ui.controller import WindowController
 from pipeline.ui.model import ViewModel
-from pipeline.ui.wiring import (
-    SILENT_TTS_NOTICE,
-    Loaders,
-    RealWiring,
-    SilenceResampler,
-    SilentTtsEngine,
-    silence_resampler_factory,
-)
-from pipeline.vad import SAMPLE_RATE_HZ
+from pipeline.ui.wiring import Loaders, RealWiring, lane_tts_config
 
 pytestmark = pytest.mark.unit
 
@@ -113,11 +110,19 @@ class FakeGuard:
         self.events.append("disarm")
 
 
-class Rig:
-    """Wiring with every loader replaced by a recording fake."""
+def _no_missing_files(settings: Settings) -> None:
+    """Stands in for ``check_files`` where the test is about something other than models."""
 
-    def __init__(self) -> None:
+
+class Rig:
+    """Wiring with every loader replaced by a recording fake (no model, no COM, no audio)."""
+
+    def __init__(self, *, models_present: bool = False) -> None:
         self.events: list[str] = []
+        self.voices = FakeVoices()
+        self.engines: list[ToneTts] = []
+        self.tts_targets: list[str] = []
+        self.tts_loads: list[Settings] = []
         self.models: list[FakeModel] = []
         self.links: list[FakeLink] = []
         self.classifier_args: list[tuple[Path, int]] = []
@@ -148,8 +153,22 @@ class Rig:
                 whisper=self._whisper,
                 translator=self._translator,
                 glossary=self._glossary,
+                tts=self._tts,
+                voice_backend=self.voices,
+                files=_no_missing_files if models_present else check_files,
             ),
         )
+
+    def _tts(self, settings: Settings) -> Callable[[str], TtsEngine]:
+        self.tts_loads.append(settings)
+
+        def make(target: str) -> TtsEngine:
+            engine = ToneTts()
+            self.engines.append(engine)
+            self.tts_targets.append(target)
+            return engine
+
+        return make
 
     def _vad(self, path: Path) -> Any:
         self.events.append("vad")
@@ -194,44 +213,52 @@ def wait_for(predicate: Callable[[], bool], what: str, timeout_s: float = 5.0) -
         time.sleep(0.002)
 
 
-# ---------------------------------------------------------------- WD10 silent speech
+# ---------------------------------------------------------------- WD10 speech
 
 
-def test_wd10_silent_speech_is_silent_non_empty_and_at_16_khz() -> None:
-    engine = SilentTtsEngine()
-    result = engine.synthesize("Guten Tag, wie geht es Ihnen heute?")
-    assert isinstance(result, Speech)
-    assert result.rate_hz == SAMPLE_RATE_HZ
-    assert result.samples.dtype == np.float32
-    assert len(result.samples) > 0
-    assert not np.any(result.samples)
+def test_wd10_the_real_loaders_are_sapi_voices_and_the_rate_converter() -> None:
+    loaders = Loaders()
+    assert loaders.resampler is RateConverter
+    assert loaders.voice_backend is ComVoiceBackend
+    settings = settings_for("--tts-rate", "3", "--tts-voice", "de=Hedda")
+    engine = loaders.tts(settings)("de")  # no COM object exists before the first sentence
+    assert isinstance(engine, SapiTts)
+    assert engine._config == TtsConfig(rate=3, volume=100, voice="Hedda")
 
 
-def test_wd10_silent_speech_length_follows_the_text_within_bounds() -> None:
-    engine = SilentTtsEngine()
-    short = len(engine.synthesize("a").samples)
-    longer = len(engine.synthesize("a" * 80).samples)
-    huge = len(engine.synthesize("a" * 100_000).samples)
-    assert short == 200 * SAMPLE_RATE_HZ // 1000  # never shorter than 200 ms
-    assert short < longer < huge
-    assert huge == 4 * SAMPLE_RATE_HZ  # never longer than 4 s
+def test_wd10_a_lane_without_a_route_speaks_with_the_default_voice_at_the_shared_rate() -> None:
+    settings = settings_for("--tts-rate", "3", "--tts-voice", "de=Hedda")
+    assert lane_tts_config(settings, "de") == TtsConfig(rate=3, voice="Hedda")
+    assert lane_tts_config(settings, "es") == TtsConfig(rate=3, voice=None)
+    engine = Loaders().tts(settings)("es")
+    assert isinstance(engine, SapiTts)
+    assert engine._config == TtsConfig(rate=3, volume=100, voice=None)
 
 
-def test_wd10_the_silence_resampler_keeps_the_duration() -> None:
-    resampler = silence_resampler_factory(16_000, 48_000)
-    assert isinstance(resampler, SilenceResampler)
-    out = resampler.process(np.zeros(1600, dtype=np.float32))
-    assert len(out) == 4800
-    assert out.dtype == np.float32
-    assert not np.any(out)
-    assert (
-        len(silence_resampler_factory(16_000, 44_100).process(np.zeros(1600, np.float32))) == 4410
-    )
+def test_wd10_the_banner_is_gone_because_a_missing_voice_is_a_problem() -> None:
+    assert RealWiring().tts_notice is None
 
 
-def test_wd10_the_banner_text_is_the_agreed_one() -> None:
-    assert SILENT_TTS_NOTICE == "TTS not installed: outputs are silent"
-    assert RealWiring().tts_notice == SILENT_TTS_NOTICE
+def test_wd10_each_lane_gets_a_tts_engine_that_the_build_closes() -> None:
+    rig = Rig(models_present=True)
+    settings = settings_for()
+    built = rig.wiring.build(settings)
+    try:
+        assert rig.tts_loads == [settings]
+        assert rig.tts_targets == ["de", "fr"]
+        assert [engine.closed for engine in rig.engines] == [0, 0]
+    finally:
+        built.pipeline.stop()
+        built.close()
+    assert [engine.closed for engine in rig.engines] == [1, 1]
+
+
+def test_wd10_an_engine_made_before_a_failed_build_is_closed() -> None:
+    rig = Rig(models_present=True)
+    rig.fail_translator_for = "fr"  # de's lane exists by then
+    with pytest.raises(FileNotFoundError):
+        rig.wiring.build(settings_for())
+    assert [engine.closed for engine in rig.engines] == [1]
 
 
 # ---------------------------------------------------------------- WD10 problems
@@ -369,8 +396,6 @@ def test_wd10_the_glossary_is_loaded_from_its_path() -> None:
 
 def _fast_settings() -> Settings:
     base = settings_for()
-    from dataclasses import replace
-
     from pipeline.capture import CaptureConfig
     from pipeline.output import OutputConfig
 
@@ -386,8 +411,13 @@ def _fast_settings() -> Settings:
     )
 
 
-def test_wd10_the_built_pipeline_runs_end_to_end_on_fakes_with_silent_speech() -> None:
-    rig = Rig()
+def _dominant_hz(audio: Any, rate_hz: int) -> float:
+    spectrum = np.abs(np.fft.rfft(audio[:, 0] * np.hanning(len(audio))))
+    return float(np.argmax(spectrum) * rate_hz / len(audio))
+
+
+def test_wd10_the_built_pipeline_speaks_at_the_device_rate_end_to_end_on_fakes() -> None:
+    rig = Rig(models_present=True)
     built = rig.wiring.build(_fast_settings())
     pipeline = built.pipeline
     vm = ViewModel(pipeline)
@@ -404,12 +434,21 @@ def test_wd10_the_built_pipeline_runs_end_to_end_on_fakes_with_silent_speech() -
         row = vm.poll().rows[0]
         assert row.text == "hello world"
         assert [cell.text for cell in row.translations] == ["[de] hello world", "[fr] hello world"]
-        # The lanes played something (silence) at the device rate, so the outputs saw audio
-        # frames and no lane error was counted.
+        # The tone is 440 Hz at 22.05 kHz; the real RateConverter must bring it to the 48 kHz
+        # device unchanged in pitch (the fake sound card only reads what the lane wrote).
+        stream = rig.output_factory.streams[0]
+        heard: list[Any] = []
+
+        def something_played() -> bool:
+            block = stream.pull(blocks=4)
+            if np.any(block):
+                heard.append(block)
+            return len(heard) >= 4
+
+        wait_for(something_played, "audio at the output")
+        assert abs(_dominant_hz(np.concatenate(heard), 48_000) - 440.0) < 20.0
         assert pipeline.metrics.counter("lane.de.errors").value == 0
         assert pipeline.metrics.counter("lane.de.utterances").value == 1
-        audio = rig.output_factory.streams[0].pull(blocks=20)
-        assert not np.any(audio)
     finally:
         vm.close()
         pipeline.stop()
@@ -417,8 +456,7 @@ def test_wd10_the_built_pipeline_runs_end_to_end_on_fakes_with_silent_speech() -
 
 
 def test_wd10_the_controller_connects_and_applies_through_the_real_wiring() -> None:
-    rig = Rig()
-    rig.wiring.problems = lambda settings: ()  # type: ignore[method-assign]  # fake folders
+    rig = Rig(models_present=True)
     controller = WindowController(_fast_settings(), rig.wiring, auto_connect=True)
     try:
         controller.start()
@@ -428,7 +466,7 @@ def test_wd10_the_controller_connects_and_applies_through_the_real_wiring() -> N
             time.sleep(0.005)
         state = controller.tick()
         assert state.session_active
-        assert state.tts_notice == SILENT_TTS_NOTICE
+        assert state.tts_notice is None
         assert controller.apply_settings({"segmenter.silence_ms": 500}).restarting
         while controller.tick().busy is not None:
             assert time.monotonic() < deadline
@@ -438,5 +476,271 @@ def test_wd10_the_controller_connects_and_applies_through_the_real_wiring() -> N
         assert state.settings.segmenter.silence_ms == 500
         assert state.generation == 2
         assert len(rig.whisper_loads) == 1  # the restart did not reload whisper
+    finally:
+        controller.shutdown()
+
+
+# ---------------------------------------------------------------- WD15 voices in problems
+
+
+def only_voice_problems(rig: Rig, settings: Settings | None = None) -> tuple[str, ...]:
+    return rig.wiring.problems(settings or settings_for())
+
+
+def test_wd15_all_voices_installed_is_no_problem() -> None:
+    rig = Rig(models_present=True)
+    assert only_voice_problems(rig) == ()
+
+
+def test_wd15_a_missing_voice_is_one_message_for_its_target_only() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.installed = [EN_VOICE, DE_VOICE]  # no French pack
+    problems = only_voice_problems(rig)
+    assert len(problems) == 1
+    assert problems[0].startswith("voice missing: ")
+    assert "language 'fr'" in problems[0]
+    assert "Microsoft Hedda Desktop" in problems[0]  # what is installed
+    assert "language pack" in problems[0]  # what to do
+    assert "; " not in problems[0]  # one entry stays one entry when the controller joins them
+
+
+def test_wd15_every_target_without_a_voice_gets_its_own_message() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.installed = [EN_VOICE]
+    problems = only_voice_problems(rig)
+    assert len(problems) == 2
+    assert "language 'de'" in problems[0]
+    assert "language 'fr'" in problems[1]
+
+
+def test_wd15_a_voice_name_that_matches_nothing_is_a_problem() -> None:
+    rig = Rig(models_present=True)
+    problems = only_voice_problems(rig, settings_for("--tts-voice", "de=Nobody"))
+    assert len(problems) == 1
+    assert "matching 'Nobody'" in problems[0]
+
+
+def test_wd15_voice_and_model_problems_are_reported_together() -> None:
+    rig = Rig()  # no models in fake-models
+    rig.voices.installed = [EN_VOICE, DE_VOICE]
+    problems = rig.wiring.problems(settings_for())
+    assert any(problem.startswith("model missing: ") for problem in problems)
+    assert any("fetch_models.py" in problem for problem in problems)
+    assert any(problem.startswith("voice missing: ") for problem in problems)
+
+
+def test_wd15_the_check_loads_no_model_and_opens_no_audio() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.installed = []
+    only_voice_problems(rig)
+    assert rig.events == []  # no model load, no guard change
+    assert rig.tts_loads == []  # no engine either
+    assert rig.input_factory.streams == []
+    assert rig.output_factory.streams == []
+
+
+def test_wd15_the_check_runs_on_its_own_thread_and_closes_its_backend_there() -> None:
+    rig = Rig(models_present=True)
+    only_voice_problems(rig)
+    me = threading.get_ident()
+    threads = set(rig.voices.created) | set(rig.voices.listed) | set(rig.voices.closed)
+    assert len(threads) == 1  # made, used and released on one thread (COM belongs to it)
+    assert me not in threads  # never the caller's: the Tk thread stays free of COM
+    assert len(rig.voices.created) == len(rig.voices.closed) == 2  # one per target
+
+
+def test_wd15_answers_are_remembered_so_the_tk_thread_asks_once() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.installed = [EN_VOICE, DE_VOICE]
+    first = only_voice_problems(rig)
+    asked = len(rig.voices.created)
+    assert asked == 2
+    assert only_voice_problems(rig) == first
+    assert len(rig.voices.created) == asked  # nothing asked again
+    only_voice_problems(rig, settings_for("--tts-voice", "de=Hedda"))
+    assert len(rig.voices.created) == asked + 1  # a new voice name is a new question
+    only_voice_problems(rig, settings_for("--tts-rate", "4"))
+    assert len(rig.voices.created) == asked + 1  # the rate does not change the voice
+
+
+def test_wd15_a_broken_speech_system_is_a_problem_and_is_asked_again() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.fail = OSError("COM is not available")
+    problems = only_voice_problems(rig)
+    assert len(problems) == 2  # reported, not raised
+    assert all(problem.startswith("speech synthesis unavailable for ") for problem in problems)
+    assert "COM is not available" in problems[0]
+    rig.voices.fail = None
+    assert only_voice_problems(rig) == ()  # a failure that passed is not remembered
+
+
+def test_wd15_the_check_is_not_blocked_by_a_model_load_in_progress() -> None:
+    # problems() runs on the Tk thread while the worker may hold the model lock for seconds.
+    rig = Rig(models_present=True)
+    held = threading.Event()
+    release = threading.Event()
+
+    def slow_whisper(path: Path, config: TranscribeConfig) -> FasterWhisperEngine:
+        held.set()
+        assert release.wait(10.0)
+        return FasterWhisperEngine(FakeModel(), config)
+
+    wiring = RealWiring(
+        devices=rig.devices,
+        input_stream_factory=rig.input_factory,
+        output_stream_factory=rig.output_factory,
+        guard=rig.guard,
+        loaders=Loaders(
+            vad=rig._vad,
+            whisper=slow_whisper,
+            translator=rig._translator,
+            tts=rig._tts,
+            voice_backend=rig.voices,
+            files=_no_missing_files,
+        ),
+    )
+    builder = threading.Thread(target=lambda: wiring.build(settings_for()).close(), daemon=True)
+    builder.start()
+    try:
+        assert held.wait(10.0)
+        started = time.monotonic()
+        assert wiring.problems(settings_for()) == ()
+        assert time.monotonic() - started < 2.0
+    finally:
+        release.set()
+        builder.join(10.0)
+
+
+# ---------------------------------------------------------------- WD15 build and lane switch
+
+
+def test_wd15_build_refuses_a_missing_voice_and_releases_what_it_made() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.installed = [EN_VOICE, DE_VOICE]
+    with pytest.raises(VoiceNotFoundError, match="language 'fr'"):
+        rig.wiring.build(settings_for("--turn-mode", "smart"))
+    assert [engine.closed for engine in rig.engines] == [1]  # de's engine, made before fr failed
+    assert [link.closed for link in rig.links] == [1]
+
+
+def one_lane_settings() -> Settings:
+    return parse_settings(
+        [
+            "--input",
+            "V380",
+            "--targets",
+            "de",
+            "--route",
+            "de=Realtek",
+            "--models-dir",
+            "fake-models",
+        ]
+    )
+
+
+def test_wd15_a_lane_switched_to_a_language_without_a_voice_keeps_the_old_lane() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.installed = [EN_VOICE, DE_VOICE]
+    built = rig.wiring.build(one_lane_settings())
+    try:
+        with pytest.raises(VoiceNotFoundError, match="language 'fr'"):
+            built.pipeline.set_output_target("de", "fr")
+        assert built.pipeline.targets == ("de",)
+    finally:
+        built.pipeline.stop()
+        built.close()
+
+
+def test_wd15_a_lane_switched_to_a_language_with_a_voice_gets_it() -> None:
+    rig = Rig(models_present=True)
+    built = rig.wiring.build(one_lane_settings())
+    try:
+        built.pipeline.set_output_target("de", "fr")
+        assert built.pipeline.targets == ("fr",)
+        assert rig.tts_targets == ["de", "fr"]
+    finally:
+        built.pipeline.stop()
+        built.close()
+    assert [engine.closed for engine in rig.engines] == [1, 1]  # the replaced lane's too
+
+
+# ---------------------------------------------------------------- WD16 window, missing voice
+
+
+def settle(controller: WindowController) -> None:
+    deadline = time.monotonic() + 10.0
+    while controller.tick().busy is not None:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+
+
+def test_wd16_a_missing_voice_acts_like_a_missing_model_in_the_controller() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.installed = [EN_VOICE, DE_VOICE]
+    controller = WindowController(_fast_settings(), rig.wiring, auto_connect=True)
+    try:
+        controller.start()
+        settle(controller)
+        state = controller.tick()
+        assert not state.session_active  # auto-connect did not start anything
+        assert len(state.problems) == 1
+        assert "language 'fr'" in state.problems[0]
+        assert state.tts_notice is None
+        assert rig.whisper_loads == []  # nothing was loaded
+        assert not controller.connect_input()  # refused, like a missing model
+        notice = controller.tick().notice
+        assert notice is not None
+        assert notice.level == "error"
+        assert notice.text.startswith("Cannot start: voice missing: ")
+        # The window keeps working: other settings are stored, the devices are listed.
+        assert controller.apply_settings({"segmenter.silence_ms": 500}).errors == {}
+        state = controller.tick()
+        assert state.settings.segmenter.silence_ms == 500
+        assert len(state.problems) == 1
+        assert state.input_devices
+    finally:
+        controller.shutdown()
+
+
+def test_wd16_the_voice_of_a_new_language_is_checked_in_standby_and_recovers() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.installed = [EN_VOICE, DE_VOICE]
+    base = _fast_settings()
+    one_lane = replace(
+        base, targets=("de",), routes=(replace(base.routes[0], tts=TtsConfig(voice="Hedda")),)
+    )
+    controller = WindowController(one_lane, rig.wiring)
+    try:
+        assert controller.tick().problems == ()
+        assert controller.set_language("de", "fr")  # stored; the French pack is missing
+        state = controller.tick()
+        assert len(state.problems) == 1
+        assert "language 'fr'" in state.problems[0]
+        assert "matching" not in state.problems[0]  # the German voice name did not follow
+        assert controller.set_language("fr", "de")
+        assert controller.tick().problems == ()
+    finally:
+        controller.shutdown()
+
+
+def test_wd16_a_running_lane_refused_for_a_missing_voice_leaves_the_session_up() -> None:
+    rig = Rig(models_present=True)
+    rig.voices.installed = [EN_VOICE, DE_VOICE]
+    base = _fast_settings()
+    one_lane = replace(base, targets=("de",), routes=base.routes[:1])
+    controller = WindowController(one_lane, rig.wiring, auto_connect=True)
+    try:
+        controller.start()
+        settle(controller)
+        assert controller.tick().session_active
+        assert controller.set_language("de", "fr")
+        settle(controller)
+        state = controller.tick()
+        assert state.session_active  # the old lane is still there
+        assert state.settings.targets == ("de",)
+        assert state.notice is not None
+        assert state.notice.level == "error"
+        assert "language 'fr'" in state.notice.text
+        assert state.generation == 1  # no restart happened
     finally:
         controller.shutdown()

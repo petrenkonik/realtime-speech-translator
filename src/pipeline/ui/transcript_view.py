@@ -125,6 +125,9 @@ class TranscriptView(ttk.Frame):
             self._rows[item_id] = row
             newest = item_id
         if follow and newest is not None:
+            # Rows inserted in this very call are not laid out yet; without this, scrolling to
+            # the newest one can stop a row short when many arrive at once.
+            self.tree.update_idletasks()
             self.tree.see(newest)
         self._summary.set(present.summary_line(snapshot))
         self._show_detail()

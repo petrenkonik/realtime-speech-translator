@@ -206,18 +206,143 @@ def _metrics_for(snapshot: Snapshot, key: str) -> str:
     return f"underruns {card_out.underruns} | dropped frames {card_out.dropped_frames}"
 
 
+def _language_name(code: str) -> str:
+    return LANGUAGE_NAMES.get(code, code)
+
+
+def stage_title(key: str, label: str) -> str:
+    """What a stage does and in which language, for its card.
+
+    Args:
+        key: Stage key of the snapshot.
+        label: The view-model's short label, used for a key this module does not know.
+    """
+    kind, _, target = key.partition(":")
+    if kind == "input":
+        return "Microphone"
+    if kind == "transcribe":
+        return f"Speech recognition ({_language_name(SOURCE_LANGUAGE)})"
+    if kind == "translate" and target:
+        name = _language_name(target)
+        return f"Translate to {target}" if name == target else f"Translate to {name} ({target})"
+    if kind == "output" and target:
+        return f"Speak / output {target}"
+    return label
+
+
 def stage_cards(snapshot: Snapshot) -> tuple[StageCardView, ...]:
     """One card per stage of the signal path, in signal order."""
     return tuple(
         StageCardView(
             key=stage.key,
-            title=stage.label,
+            title=stage_title(stage.key, stage.label),
             health=stage.health,
             word=HEALTH_WORDS[stage.health],
             detail=stage.detail,
             metrics=_metrics_for(snapshot, stage.key),
         )
         for stage in snapshot.stages
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class LaneCards:
+    """The two boxes of one language lane (a missing one is ``None``).
+
+    Attributes:
+        target: Target language code of the lane.
+        translate: The translation card.
+        output: The speech and output-device card.
+    """
+
+    target: str
+    translate: StageCardView | None
+    output: StageCardView | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessLayout:
+    """The process strip as a fork: common stages, then lanes that run in parallel.
+
+    Attributes:
+        common: Stages every utterance passes once, in signal order (microphone, recognition).
+        lanes: One entry per target, in snapshot order. After recognition every lane gets the
+            utterance at the same time; no lane waits for another.
+    """
+
+    common: tuple[StageCardView, ...]
+    lanes: tuple[LaneCards, ...]
+
+    def keys(self) -> tuple[str, ...]:
+        """Every card key, common stages first; the window rebuilds only when this changes."""
+        keys = [card.key for card in self.common]
+        for lane in self.lanes:
+            keys.extend(card.key for card in (lane.translate, lane.output) if card is not None)
+        return tuple(keys)
+
+
+def group_stage_cards(cards: Iterable[StageCardView]) -> ProcessLayout:
+    """Sort stage cards into the common part and one lane per target.
+
+    Lanes appear in the order their first card appears; a lane with only one of its two cards
+    keeps a gap rather than failing.
+    """
+    common: list[StageCardView] = []
+    translate: dict[str, StageCardView] = {}
+    output: dict[str, StageCardView] = {}
+    order: list[str] = []
+    for card in cards:
+        kind, _, target = card.key.partition(":")
+        if kind in ("translate", "output") and target:
+            if target not in order:
+                order.append(target)
+            (translate if kind == "translate" else output)[target] = card
+        else:
+            common.append(card)
+    lanes = tuple(LaneCards(t, translate.get(t), output.get(t)) for t in order)
+    return ProcessLayout(common=tuple(common), lanes=lanes)
+
+
+def process_layout(snapshot: Snapshot) -> ProcessLayout:
+    """The snapshot's stage cards grouped as a fork."""
+    return group_stage_cards(stage_cards(snapshot))
+
+
+Segment = tuple[int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class ForkGeometry:
+    """Line segments (x1, y1, x2, y2) of the connector from recognition to the lane rows.
+
+    Attributes:
+        stem: Enters from the left at the middle of the bar; ``None`` with no lanes.
+        bar: Vertical bar joining the branches; ``None`` with fewer than two lanes.
+        branches: One horizontal segment per lane, ending at the lane row.
+    """
+
+    stem: Segment | None
+    bar: Segment | None
+    branches: tuple[Segment, ...]
+
+
+def fork_geometry(*, width_px: int, lane_ys: Sequence[int]) -> ForkGeometry:
+    """Where to draw the fork connector.
+
+    Args:
+        width_px: Width of the connector area.
+        lane_ys: Vertical centre of every lane row, top to bottom.
+    """
+    if not lane_ys:
+        return ForkGeometry(None, None, ())
+    bar_x = width_px // 2
+    top, bottom = lane_ys[0], lane_ys[-1]
+    middle = (top + bottom) // 2
+    bar = (bar_x, top, bar_x, bottom) if len(lane_ys) > 1 else None
+    return ForkGeometry(
+        stem=(0, middle, bar_x, middle),
+        bar=bar,
+        branches=tuple((bar_x, y, width_px, y) for y in lane_ys),
     )
 
 

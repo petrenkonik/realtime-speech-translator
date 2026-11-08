@@ -12,22 +12,28 @@ silence threshold restarts in a moment. They are only ever used by one pipeline 
 the old one is stopped before the new one starts. The VAD is always created fresh because its
 recurrent state belongs to one stream.
 
-Known gap: there is no Windows SAPI speech synthesis yet (work-plan step 11). ``SilentTtsEngine``
-stands in for it. It returns silence of a plausible length, so the lanes, resampling, outputs
-and latency figures all run, but nothing audible is played; ``SILENT_TTS_NOTICE`` is shown as
-a banner in the window. Remove the placeholder and the ``SilenceResampler`` with step 11.
+Speech is the Windows SAPI voices (``tts_sapi``) and the lanes convert it to each device's
+rate with ``RateConverter``. A voice is a Windows language pack, not a downloaded model, so
+it is checked like one: ``problems`` reports a missing voice per target (inline in the window,
+and the apply flow refuses on it), and ``tts_notice`` is therefore always ``None`` here.
+
+COM threading. Nothing in this module touches COM on the Tk thread or on the worker thread.
+``SapiTts`` makes its COM backend lazily on the lane thread that first speaks. The voice check
+(``problems``, which the controller calls on the Tk thread, and the per-lane check in
+``build``) runs ``check_voices`` on a short-lived helper thread that is joined at once: its
+backend initialises COM there and the apartment ends with that thread. The installed voices do
+not change while the program runs (the message says to restart after installing a language
+pack), so each answer is cached and the helper thread is needed once per target.
 """
 
 from __future__ import annotations
 
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
-
-import numpy as np
+from typing import Protocol, TypeVar
 
 from pipeline.app import Pipeline
 from pipeline.config import VAD_MODEL, ConfigError, Settings, check_files
@@ -41,53 +47,113 @@ from pipeline.devices import (
 )
 from pipeline.glossary import Glossary
 from pipeline.guards import StrictGuard
-from pipeline.lanes import Resampler, Speech, Translator, TtsEngine
+from pipeline.lanes import ResamplerFactory, Translator, TtsEngine
+from pipeline.resample import RateConverter
 from pipeline.transcribe import FasterWhisperEngine, TranscribeConfig, whisper_model_dir
 from pipeline.translate import CtranslateTranslator, TranslateConfig, translator_model_dir
+from pipeline.tts_sapi import (
+    ComVoiceBackend,
+    TtsConfig,
+    VoiceBackend,
+    VoiceNotFoundError,
+    check_voices,
+    sapi_tts_factory,
+)
 from pipeline.turn import DEFAULT_TURN_MODEL, OnnxTurnClassifier, ThreadedTurnLink, TurnClassifier
-from pipeline.ui.controller import BuiltPipeline
-from pipeline.vad import SAMPLE_RATE_HZ, Float32Array, Segmenter, SileroVad, TurnLink, VadStage
+from pipeline.ui.controller import BuiltPipeline, describe_error
+from pipeline.vad import Segmenter, SileroVad, TurnLink, VadStage
 
-SILENT_TTS_NOTICE = "TTS not installed: outputs are silent"
+_T = TypeVar("_T")
 
-_SILENCE_MS_PER_CHAR = 20
-_SILENCE_MIN_MS = 200
-_SILENCE_MAX_MS = 4_000
-
-
-# --- placeholder speech ----------------------------------------------------------------------
+# A COM call that never answers must not freeze the window for good.
+_VOICE_CHECK_TIMEOUT_S = 30.0
 
 
-class SilentTtsEngine:
-    """Placeholder ``TtsEngine``: silence whose length follows the text (see the module note)."""
-
-    def synthesize(self, text: str) -> Speech:
-        """Return 16 kHz silence of 20 ms per character, between 200 ms and 4 s."""
-        ms = min(_SILENCE_MAX_MS, max(_SILENCE_MIN_MS, len(text.strip()) * _SILENCE_MS_PER_CHAR))
-        return Speech(
-            samples=np.zeros(ms * SAMPLE_RATE_HZ // 1000, dtype=np.float32), rate_hz=SAMPLE_RATE_HZ
-        )
+# --- speech ----------------------------------------------------------------------------------
 
 
-class SilenceResampler:
-    """Resamples silence by length only.
+def lane_tts_config(settings: Settings, target: str) -> TtsConfig:
+    """The voice settings of the lane of ``target``.
 
-    ``StreamingResampler`` cannot produce the device rates the lanes need yet (spec step 11);
-    this is exact for the silent placeholder speech and wrong for anything else.
+    A language that has no route yet (a lane switched at run time) speaks with the default
+    voice of its language and the rate and volume of the first lane: ``--tts-rate`` is the
+    same for every lane, whereas a voice name belongs to one language.
     """
-
-    def __init__(self, in_rate_hz: int, out_rate_hz: int) -> None:
-        """Remember the two rates."""
-        self._ratio = out_rate_hz / in_rate_hz
-
-    def process(self, block: Float32Array) -> Float32Array:
-        """Return silence as long as ``block`` would be at the output rate."""
-        return np.zeros(round(len(block) * self._ratio), dtype=np.float32)
+    for route in settings.routes:
+        if route.target == target:
+            return route.tts
+    first = settings.routes[0].tts if settings.routes else TtsConfig()
+    return TtsConfig(rate=first.rate, volume=first.volume)
 
 
-def silence_resampler_factory(in_rate_hz: int, out_rate_hz: int) -> Resampler:
-    """``ResamplerFactory`` for the placeholder speech."""
-    return SilenceResampler(in_rate_hz, out_rate_hz)
+class _LaneTtsConfigs(Mapping[str, TtsConfig]):
+    """``target -> TtsConfig`` for ``sapi_tts_factory``, with ``lane_tts_config``'s fallback."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def __getitem__(self, target: str) -> TtsConfig:
+        return lane_tts_config(self._settings, target)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._settings.targets)
+
+    def __len__(self) -> int:
+        return len(self._settings.targets)
+
+
+def _sapi_tts(settings: Settings) -> Callable[[str], TtsEngine]:
+    return sapi_tts_factory(_LaneTtsConfigs(settings))
+
+
+@dataclass(frozen=True, slots=True)
+class _VoiceAnswer:
+    """What the voice check found for one target: a problem text or ``None``."""
+
+    problem: str | None
+    final: bool  # False for a COM failure that may pass, so it is asked again
+
+
+def _check_voice(
+    backend_factory: Callable[[], VoiceBackend], target: str, config: TtsConfig
+) -> _VoiceAnswer:
+    try:
+        check_voices({target: config}, backend_factory=backend_factory)
+    except VoiceNotFoundError as error:
+        return _VoiceAnswer(f"voice missing: {error}", final=True)
+    except Exception as error:  # COM or comtypes failed: say so, never take the window down
+        return _VoiceAnswer(
+            f"speech synthesis unavailable for {target}: {describe_error(error)}", final=False
+        )
+    return _VoiceAnswer(None, final=True)
+
+
+def _on_own_thread(job: Callable[[], _T]) -> _T:
+    """Run ``job`` on a new thread and wait for it.
+
+    COM is initialised per thread. Doing the voice check here keeps the caller's thread (the
+    Tk thread) free of COM, and the apartment ends with this thread.
+
+    Raises:
+        TimeoutError: The job did not finish within ``_VOICE_CHECK_TIMEOUT_S``.
+    """
+    done: list[_T] = []
+    failed: list[Exception] = []
+
+    def run() -> None:
+        try:
+            done.append(job())
+        except Exception as error:  # handed back to the caller below
+            failed.append(error)
+
+    thread = threading.Thread(target=run, name="voice-check", daemon=True)
+    thread.start()
+    thread.join(_VOICE_CHECK_TIMEOUT_S)
+    if thread.is_alive():
+        raise TimeoutError(f"speech synthesis did not answer within {_VOICE_CHECK_TIMEOUT_S:.0f} s")
+    if failed:
+        raise failed[0]
+    return done[0]
 
 
 # --- loaders ---------------------------------------------------------------------------------
@@ -134,6 +200,11 @@ class Loaders:
         whisper: ``(model dir, config) -> engine``, already warmed up.
         translator: ``(model dir, config) -> translator``.
         glossary: ``path -> Glossary``.
+        tts: ``settings -> (target -> TtsEngine)``; the SAPI engines of the lanes.
+        resampler: ``(in rate, out rate) -> Resampler`` from the speech rate to a device rate.
+        voice_backend: Makes the SAPI access used by the voice check (``problems`` and the
+            check in ``build``); a fake in tests, so no COM is touched.
+        files: Raises ``ConfigError`` when a model or the glossary file is missing.
     """
 
     vad: Callable[[Path], SileroVad] = SileroVad
@@ -142,6 +213,10 @@ class Loaders:
     whisper: Callable[[Path, TranscribeConfig], FasterWhisperEngine] = _load_whisper
     translator: Callable[[Path, TranslateConfig], Translator] = CtranslateTranslator.load
     glossary: Callable[[Path], Glossary] = Glossary.from_file
+    tts: Callable[[Settings], Callable[[str], TtsEngine]] = _sapi_tts
+    resampler: ResamplerFactory = RateConverter
+    voice_backend: Callable[[], VoiceBackend] = ComVoiceBackend
+    files: Callable[[Settings], None] = check_files
 
 
 def _close_all(closers: list[Callable[[], None]]) -> None:
@@ -182,23 +257,34 @@ class RealWiring:
         self._lock = threading.Lock()
         self._engines: dict[tuple[Path, str, int], FasterWhisperEngine] = {}
         self._translators: dict[tuple[Path, TranslateConfig], Translator] = {}
+        # Its own lock: ``_lock`` is held for seconds while a model loads, and ``problems`` runs
+        # on the Tk thread, which must not wait for that.
+        self._voice_lock = threading.Lock()
+        self._voice_answers: dict[tuple[str, str | None], str | None] = {}
 
     @property
     def tts_notice(self) -> str | None:
-        """The banner that says speech is a silent placeholder."""
-        return SILENT_TTS_NOTICE
+        """Always ``None``: a missing voice is a problem (``problems``), not a banner."""
+        return None
 
     def devices(self) -> DeviceListing:
         """The device list source."""
         return self._listing
 
     def problems(self, settings: Settings) -> tuple[str, ...]:
-        """Missing models and files, one message each, without loading anything."""
+        """Missing models, files and speech voices, one message each.
+
+        Loads no model and opens no audio. The voice check asks SAPI for the installed voices on
+        a helper thread (see the module note) and remembers the answer, so only the first call
+        per language (and per voice name) takes a moment; it is called on the Tk thread.
+        """
+        found: list[str] = []
         try:
-            check_files(settings)
+            self._loaders.files(settings)
         except ConfigError as error:
-            return tuple(str(error).split("; "))
-        return ()
+            found.extend(str(error).split("; "))
+        found.extend(self._voice_problems(settings, settings.targets))
+        return tuple(found)
 
     def build(self, settings: Settings) -> BuiltPipeline:
         """Load what is needed and build a ``Pipeline`` (not started).
@@ -218,6 +304,7 @@ class RealWiring:
                 else self._loaders.glossary(settings.glossary_path)
             )
             engine = self._whisper(settings)
+            speak = self._loaders.tts(settings)
             pipeline = Pipeline(
                 settings,
                 devices=self._listing,
@@ -226,9 +313,9 @@ class RealWiring:
                 stage_factory=lambda current: self._stage(current, closers),
                 speech_to_text=engine,
                 translator_factory=lambda target: self._translator(settings, target),
-                tts_factory=_silent_tts,
+                tts_factory=lambda target: self._speaker(settings, target, speak, closers),
                 glossary=glossary,
-                resampler_factory=silence_resampler_factory,
+                resampler_factory=self._loaders.resampler,
             )
             # Armed only now: every model is read and nothing below writes or connects.
             if settings.strict:
@@ -264,6 +351,58 @@ class RealWiring:
                 self._translators[key] = translator
         return translator
 
+    def _voice_problems(self, settings: Settings, targets: tuple[str, ...]) -> list[str]:
+        """One message per target whose voice is missing, asking SAPI only for new questions."""
+        keys = [(target, lane_tts_config(settings, target).voice) for target in targets]
+        with self._voice_lock:
+            answers = {key: self._voice_answers[key] for key in keys if key in self._voice_answers}
+        new = [key for key in keys if key not in answers]
+        if new:
+            fresh = self._ask_voices(settings, [target for target, _ in new])
+            with self._voice_lock:
+                for key, answer in zip(new, fresh, strict=True):
+                    answers[key] = answer.problem
+                    if answer.final:  # a COM failure is not remembered: the next call asks again
+                        self._voice_answers[key] = answer.problem
+        return [problem for key in keys if (problem := answers[key]) is not None]
+
+    def _ask_voices(self, settings: Settings, targets: list[str]) -> list[_VoiceAnswer]:
+        backend_factory = self._loaders.voice_backend
+
+        def check_all() -> list[_VoiceAnswer]:
+            return [
+                _check_voice(backend_factory, target, lane_tts_config(settings, target))
+                for target in targets
+            ]
+
+        try:
+            return _on_own_thread(check_all)
+        except TimeoutError as error:
+            return [_VoiceAnswer(f"speech synthesis unavailable: {error}", final=False)] * len(
+                targets
+            )
+
+    def _speaker(
+        self,
+        settings: Settings,
+        target: str,
+        speak: Callable[[str], TtsEngine],
+        closers: list[Callable[[], None]],
+    ) -> TtsEngine:
+        """The engine of one lane; a language without a voice fails here, before the lane exists.
+
+        Called on the thread that builds the pipeline or switches a lane (the worker), so a
+        language chosen at run time is refused with the old lane left working.
+        """
+        problems = self._voice_problems(settings, (target,))
+        if problems:
+            raise VoiceNotFoundError(problems[0])
+        engine = speak(target)
+        close = getattr(engine, "close", None)  # SapiTts releases its COM backends
+        if callable(close):
+            closers.append(close)
+        return engine
+
     def _stage(self, settings: Settings, closers: list[Callable[[], None]]) -> VadStage:
         vad = self._loaders.vad(settings.models_dir / VAD_MODEL)
         segmenter = Segmenter(settings.segmenter)
@@ -275,7 +414,3 @@ class RealWiring:
             link = self._loaders.turn_link(classifier)
             closers.append(link.close)
         return VadStage(vad, segmenter, link)
-
-
-def _silent_tts(target: str) -> TtsEngine:
-    return SilentTtsEngine()

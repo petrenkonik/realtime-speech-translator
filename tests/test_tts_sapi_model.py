@@ -7,11 +7,14 @@ French voices come with language packs: their tests skip, with the reason, when 
 from __future__ import annotations
 
 import statistics
+import threading
 import time
 
 import numpy as np
 import pytest
+from fakes import FakeDeviceList
 
+from pipeline.config import Settings, parse_settings
 from pipeline.tts_sapi import (
     PCM_RATE_HZ,
     ComVoiceBackend,
@@ -20,6 +23,7 @@ from pipeline.tts_sapi import (
     VoiceNotFoundError,
     check_voices,
 )
+from pipeline.ui.wiring import Loaders, RealWiring
 
 pytestmark = pytest.mark.model
 
@@ -116,3 +120,50 @@ def test_t5_the_installed_voices_are_listed_with_their_languages() -> None:
         backend.close()
     assert voices
     assert all(voice.language_ids for voice in voices)
+
+
+# --- the window's wiring on the real voices (WD17) ----------------------------------------------
+
+
+def _settings() -> Settings:
+    return parse_settings(["--input", "V380", "--route", "de=Realtek,fr=HS100W"])
+
+
+def test_wd17_the_wiring_voice_check_and_speech_touch_no_disk_or_network(
+    no_disk_writes: list[object],
+) -> None:
+    """The real voice check (helper thread) and a real sentence, under the strict-mode guard.
+
+    The guard's audit hook is process-wide, so it sees the helper thread and the speaking
+    thread too. English only, because every Windows install has that voice (the lanes' own
+    languages need packs); the wiring answers for a language without a route with the defaults.
+    Memory streams only: no audio device is opened.
+    """
+    wiring = RealWiring(devices=FakeDeviceList([]))
+    assert wiring._voice_problems(_settings(), ("en",)) == []
+    engine = Loaders().tts(_settings())("en")
+    speech = engine.synthesize("Good morning, everyone.")
+    assert len(speech.samples) > PCM_RATE_HZ // 4
+    assert float(np.max(np.abs(speech.samples))) > 0.05
+    assert no_disk_writes == []
+
+
+def test_wd17_the_real_voice_check_runs_off_the_calling_thread() -> None:
+    calls: list[int] = []
+
+    class Spy(ComVoiceBackend):
+        def __init__(self) -> None:
+            calls.append(threading.get_ident())
+            super().__init__()
+
+    wiring = RealWiring(devices=FakeDeviceList([]), loaders=Loaders(voice_backend=Spy))
+    assert wiring._voice_problems(_settings(), ("en",)) == []
+    assert calls
+    assert threading.get_ident() not in calls
+
+
+def test_wd17_a_language_without_a_voice_is_reported_by_the_real_check() -> None:
+    wiring = RealWiring(devices=FakeDeviceList([]))
+    problems = wiring._voice_problems(_settings(), ("xx",))
+    assert len(problems) == 1
+    assert problems[0].startswith("voice missing: no SAPI voice for language 'xx'")

@@ -87,15 +87,15 @@ model, shorter encoder context, or a faster machine.
 - Microphone connect/disconnect/switch, output connect per language lane,
   live stage tiles with health words (OK / warning / problem), transcript with
   pause and processing columns, copy report.
-- End-to-end speech -> text -> translation for a connected output; a lane
-  whose output is away idles and skips utterances (visible in the tile).
+- End-to-end speech -> text -> translation -> Windows SAPI speech for a
+  connected output; a lane whose output is away idles and skips utterances
+  (visible in the tile). A missing language pack (voice) is listed inline like
+  a missing model and stops Connect; the window stays usable. Real audible
+  playback through the window has not been verified on a speaker yet.
 - Every segmentation setting is changeable at runtime from the Settings tab.
 
 Known gaps:
 
-- **Outputs are silent**: the window still wires the placeholder
-  `SilentTtsEngine` instead of `tts_sapi.sapi_tts_factory` (work-plan step 11
-  wiring), hence the banner "TTS not installed: outputs are silent".
 - `python -B -m pipeline run` / `soak` CLI commands and the 60-minute soak
   run are still to be written.
 - Smart Turn is implemented but measured slow on this CPU, so `turn_mode`
@@ -199,9 +199,9 @@ python -B -m pipeline gui                 # control window: devices, languages, 
 ```
 
 `gui` starts even with no device chosen; devices and languages are picked in
-the window. Until the TTS wiring gap (see above) is closed it plays silence
-and shows the banner "TTS not installed: outputs are silent". The `run` and
-`soak` commands are still to be written.
+the window. It speaks with the installed Windows voices; German and French need
+their Windows language packs (Settings > Time & language > Language). The `run`
+and `soak` commands are still to be written.
 
 ## Development
 

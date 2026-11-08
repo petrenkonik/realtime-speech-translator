@@ -286,6 +286,119 @@ def test_wd4_card_text_never_contains_utterance_text(fake: FakePipeline, vm: Vie
     assert SECRET_DE not in blob
 
 
+# ---------------------------------------------------------------- WD17-WD18 process fork
+
+
+def card(key: str, title: str = "t") -> present.StageCardView:
+    return present.StageCardView(key, title, Health.OK, "OK", "", "")
+
+
+def test_wd17_two_lanes_fork_after_the_common_stages() -> None:
+    cards = present.stage_cards(snapshot_of(FakePipeline()))
+    layout = present.group_stage_cards(cards)
+    assert [c.key for c in layout.common] == ["input", "transcribe"]
+    assert [lane.target for lane in layout.lanes] == ["de", "fr"]
+    for lane in layout.lanes:
+        assert lane.translate is not None
+        assert lane.output is not None
+        assert lane.translate.key == f"translate:{lane.target}"
+        assert lane.output.key == f"output:{lane.target}"
+
+
+def test_wd17_the_layout_of_a_snapshot_is_the_grouped_cards() -> None:
+    snap = snapshot_of(FakePipeline())
+    assert present.process_layout(snap) == present.group_stage_cards(present.stage_cards(snap))
+
+
+def test_wd17_one_lane_is_a_single_row() -> None:
+    cards = [card("input"), card("transcribe"), card("translate:fr"), card("output:fr")]
+    layout = present.group_stage_cards(cards)
+    assert [c.key for c in layout.common] == ["input", "transcribe"]
+    assert len(layout.lanes) == 1
+    assert layout.lanes[0].target == "fr"
+
+
+def test_wd17_no_lanes_leaves_only_the_common_stages() -> None:
+    layout = present.group_stage_cards([card("input"), card("transcribe")])
+    assert [c.key for c in layout.common] == ["input", "transcribe"]
+    assert layout.lanes == ()
+
+
+def test_wd17_a_missing_output_card_leaves_a_gap_not_a_crash() -> None:
+    layout = present.group_stage_cards(
+        [card("input"), card("transcribe"), card("translate:de"), card("output:fr")]
+    )
+    assert [
+        (lane.target, lane.translate is None, lane.output is None) for lane in layout.lanes
+    ] == [
+        ("de", False, True),
+        ("fr", True, False),
+    ]
+
+
+def test_wd17_the_lane_order_follows_the_snapshot_not_the_alphabet() -> None:
+    cards = [
+        card("input"),
+        card("transcribe"),
+        card("translate:fr"),
+        card("output:fr"),
+        card("translate:de"),
+        card("output:de"),
+    ]
+    layout = present.group_stage_cards(cards)
+    assert [lane.target for lane in layout.lanes] == ["fr", "de"]
+
+
+def test_wd17_the_layout_lists_its_keys_for_change_detection() -> None:
+    fake = FakePipeline()
+    before = present.process_layout(snapshot_of(fake))
+    assert before.keys() == (
+        "input",
+        "transcribe",
+        "translate:de",
+        "output:de",
+        "translate:fr",
+        "output:fr",
+    )
+
+
+def test_wd18_titles_say_what_the_stage_does_and_the_language() -> None:
+    cards = {c.key: c for c in present.stage_cards(snapshot_of(FakePipeline()))}
+    assert cards["input"].title == "Microphone"
+    assert cards["transcribe"].title == "Speech recognition (English)"
+    assert cards["translate:de"].title == "Translate to German (de)"
+    assert cards["translate:fr"].title == "Translate to French (fr)"
+    assert cards["output:de"].title == "Speak / output de"
+    assert cards["output:fr"].title == "Speak / output fr"
+
+
+def test_wd18_an_unknown_language_falls_back_to_its_code() -> None:
+    assert present.stage_title("translate:xx", "Translation xx") == "Translate to xx"
+    assert present.stage_title("output:xx", "Output xx") == "Speak / output xx"
+    assert present.stage_title("something", "Whatever") == "Whatever"
+
+
+def test_wd18_the_fork_has_one_stem_one_bar_and_a_branch_per_lane() -> None:
+    fork = present.fork_geometry(width_px=40, lane_ys=(20, 80))
+    assert fork.stem == (0, 50, 20, 50)  # enters at the middle of the bar
+    assert fork.bar == (20, 20, 20, 80)
+    assert fork.branches == ((20, 20, 40, 20), (20, 80, 40, 80))
+
+
+def test_wd18_the_fork_of_one_lane_is_a_straight_line_without_a_bar() -> None:
+    fork = present.fork_geometry(width_px=40, lane_ys=(30,))
+    assert fork.stem == (0, 30, 20, 30)
+    assert fork.bar is None
+    assert fork.branches == ((20, 30, 40, 30),)
+
+
+def test_wd18_no_lanes_draw_nothing() -> None:
+    fork = present.fork_geometry(width_px=40, lane_ys=())
+    assert fork.stem is None
+    assert fork.bar is None
+    assert fork.branches == ()
+
+
 # ---------------------------------------------------------------- WD14 Tk-free
 
 

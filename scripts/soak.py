@@ -101,6 +101,7 @@ class SoakReport:
     rss_growth_mb_per_h: float
     write_operations: int
     write_bytes: int
+    max_scheduler_stall_ms: float = 0.0
 
 
 # --- pure helpers (unit tested) -------------------------------------------------------------
@@ -152,6 +153,46 @@ def rss_growth_mb_per_hour(samples: Sequence[tuple[float, float]], warmup_s: flo
         return 0.0
     (t0, mb0), (t1, mb1) = settled[0], settled[-1]
     return max(0.0, (mb1 - mb0) * 3600.0 / (t1 - t0))
+
+
+class JitterProbe:
+    """Measures how late a sleeping thread of this process wakes up.
+
+    A late wake-up on an idle thread means the whole process was not scheduled (a busy
+    machine, another program), not that one of its stages is slow. ``observe`` takes one
+    lateness in seconds; ``take`` returns the worst and the number of long ones since the last
+    call and starts over, while ``worst_ms`` keeps the worst of the whole run.
+    """
+
+    def __init__(self, long_ms: float = 100.0) -> None:
+        self._long_ms = long_ms
+        self._lock = threading.Lock()
+        self._worst_ms = 0.0
+        self._long = 0
+        self.worst_ms = 0.0
+
+    def observe(self, late_s: float) -> None:
+        """Record one wake-up that was ``late_s`` seconds late."""
+        late_ms = late_s * 1000.0
+        with self._lock:
+            self._worst_ms = max(self._worst_ms, late_ms)
+            self.worst_ms = max(self.worst_ms, late_ms)
+            if late_ms >= self._long_ms:
+                self._long += 1
+
+    def take(self) -> tuple[float, int]:
+        """(worst lateness in ms, number of long ones) since the previous call."""
+        with self._lock:
+            result = (self._worst_ms, self._long)
+            self._worst_ms, self._long = 0.0, 0
+        return result
+
+    def run(self, stop: threading.Event, interval_s: float = 0.01) -> None:
+        """Sleep and measure until ``stop`` is set (the body of the probe thread)."""
+        while not stop.is_set():
+            before = time.perf_counter()
+            time.sleep(interval_s)
+            self.observe(time.perf_counter() - before - interval_s)
 
 
 def _criteria(report: SoakReport) -> list[tuple[str, str, str, bool]]:
@@ -211,6 +252,10 @@ def format_report(report: SoakReport) -> str:
     lines = [f"Soak report, {report.minutes:.1f} min"]
     for name, value, limit, ok in _criteria(report):
         lines.append(f"  {'ok  ' if ok else 'FAIL'} {name:<26} {value:<28} limit {limit}")
+    lines.append(
+        f"  info scheduler stall max ms     {report.max_scheduler_stall_ms:.0f}"
+        "                        (not judged: a late wake-up of an idle thread)"
+    )
     lines.append("PASS" if not evaluate(report) else "FAIL")
     return "\n".join(lines)
 
@@ -340,6 +385,10 @@ def run_soak(options: SoakOptions) -> SoakReport:
             subscription.get(0.1)
 
     drainer = threading.Thread(target=drain, name="soak-consumer", daemon=True)
+    jitter = JitterProbe()
+    jitter_thread = threading.Thread(
+        target=jitter.run, args=(consumed,), name="soak-jitter", daemon=True
+    )
     capture = CaptureSession(
         CaptureConfig(options.cable_out),
         listing,
@@ -366,6 +415,7 @@ def run_soak(options: SoakOptions) -> SoakReport:
     started_capture = False
     try:
         drainer.start()
+        jitter_thread.start()
         output.start()
         capture.start()
         started_capture = True
@@ -398,11 +448,14 @@ def run_soak(options: SoakOptions) -> SoakReport:
                 next_sample = now + options.sample_interval_s
                 if capture.fatal_error is not None:
                     raise SoakError(f"capture ended: {capture.fatal_error}")
+                stall_ms, long_stalls = jitter.take()
                 if options.progress:
                     print(
                         f"{(now - began) / 60:5.1f} min  chunks {stats.chunks}/{expected_chunks}"
-                        f"  overflow {stats.input_overflow}  cb {stats.max_callback_ms:.2f} ms"
-                        f"  rss {rss_samples[-1][1]:.0f} MB",
+                        f"  overflow {stats.input_overflow}  ring_lost {stats.ring_lost_frames}"
+                        f"  underruns {output.stats().underruns}"
+                        f"  cb {stats.max_callback_ms:.2f} ms  rss {rss_samples[-1][1]:.0f} MB"
+                        f"  stall {stall_ms:.0f} ms ({long_stalls} long)",
                         flush=True,
                     )
         time.sleep(1.0)  # the last stream's silence closes its final chunk
@@ -439,6 +492,7 @@ def run_soak(options: SoakOptions) -> SoakReport:
         rss_growth_mb_per_h=rss_growth_mb_per_hour(rss_samples, warmup),
         write_operations=writes1 - writes0,
         write_bytes=bytes1 - bytes0,
+        max_scheduler_stall_ms=jitter.worst_ms,
     )
 
 

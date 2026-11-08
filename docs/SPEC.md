@@ -697,7 +697,7 @@ which step. "Open" means a decision or measurement is still needed.
   run time, plus the live `hide_text`) in the UI thread, so errors come back at once with their
   field keys. No change: a notice. Only `hide_text` changed (`needs_restart` is false): applied
   live, no restart. In standby: stored. Otherwise: models are checked first (`Wiring.problems`;
-  a missing model refuses the apply before anything is stopped), then one worker job does
+  a missing model or voice refuses the apply before anything is stopped), then one worker job does
   `old.stop()`, `old.close()` (releases what the wiring made for it), `Wiring.build(new)`,
   `start(lenient=True)`, restores the devices the user had disconnected on purpose, and creates
   a new `ViewModel`. The UI thread then swaps the session, closes the old view-model and
@@ -712,7 +712,16 @@ which step. "Open" means a decision or measurement is still needed.
   error, and a level meter that appears only if a snapshot ever carries a level (today
   `InputCard.level` is `None`). *Outputs*: per lane a language box (`SUPPORTED_TARGETS` without
   the source and without languages used by other lanes), a device box (WASAPI outputs), a dot
-  and Connect / Disconnect. *Process*: one box per stage key of the snapshot, coloured ok green,
+  and Connect / Disconnect. *Process*: a fork diagram, not one flat row. Left, one row: *Microphone*
+  then *Speech recognition (English)*. From recognition a connector (stem, vertical bar, one
+  arrowed branch per lane, drawn on a canvas) leads into a titled *In parallel* box with one row
+  per target, each row labelled `de - German` and holding *Translate to German (de)* then
+  *Speak / output de*; the only arrow inside a lane joins its own two boxes, and no arrow joins
+  one lane to another (after recognition every lane gets the utterance at once and runs on its
+  own thread). With one lane there is one row, with none only the left part. `present.py`
+  groups the snapshot's stage keys (`input`, `transcribe`, `translate:<t>`, `output:<t>`) into
+  `ProcessLayout(common, lanes)` and computes the connector's segments (`fork_geometry`); the
+  window rebuilds only when the set of keys changes. One box per stage key, coloured ok green,
   warning amber, problem red, idle grey and always carrying the word, the reason, and numbers
   (decode or lane latency p50 / p95, drops, overflows, lost frames, underruns, errors).
   *Transcript*: `ttk.Treeview` with time (stream clock), pause, text, one column per target
@@ -724,8 +733,9 @@ which step. "Open" means a decision or measurement is still needed.
   `Field` kind (spin box with min / max / step, drop-down, switch), range and unit, help text,
   a restart note per field and per page, an inline error under the field, Advanced fields hidden
   until "Show advanced settings" (an error in one opens them), Apply, Discard edits, Reset to
-  defaults. Banners: the silent-speech notice and, inline instead of a dialog, the list of
-  missing models. A status bar shows the busy state and the latest notice. Fonts are 10 pt and
+  defaults. Banners: a speech notice (only for a wiring that returns one; `RealWiring` never
+  does) and, inline instead of a dialog, the list of what is missing (models, files, speech
+  voices). A status bar shows the busy state and the latest notice. Fonts are 10 pt and
   every colour pair has at least 4.5:1 contrast.
 - **Wiring (`ui/wiring.py`).** `RealWiring.build(settings)` loads Silero VAD (fresh per build),
   Smart Turn plus `ThreadedTurnLink` when `turn_mode` is `smart` (the link is closed by
@@ -736,11 +746,37 @@ which step. "Open" means a decision or measurement is still needed.
   (`HF_HUB_OFFLINE=1`); every loader, the stream factories, the device list and the strict guard
   are injected. With `strict` it arms the `StrictGuard` after the loads, otherwise it releases it.
   A failure while building closes what was created.
-- **Known gap: speech synthesis.** There is no Windows SAPI `TtsEngine` yet (step 11).
-  `SilentTtsEngine` stands in for it: 16 kHz silence of 20 ms per character (200 ms to 4 s), and
-  `SilenceResampler` converts that to the device rate by length only. The lanes, outputs and
-  latency figures run; nothing audible is played; the window shows the banner "TTS not
-  installed: outputs are silent". Both are removed with step 11.
+- **Speech (WD10, WD15-WD17).** `RealWiring.build` passes `tts_factory` from `Loaders.tts`
+  (default `tts_sapi.sapi_tts_factory` over the routes' `LaneRoute.tts`) and `resampler_factory`
+  from `Loaders.resampler` (default `RateConverter`, so a 22.05 kHz voice reaches any device
+  rate). `Loaders.voice_backend` (default `ComVoiceBackend`) and `Loaders.files` (default
+  `check_files`) are injectable, so tests use fakes and never touch COM. The engines a build
+  creates are closed by `BuiltPipeline.close`. A lane switched at run time has no route yet: it
+  speaks with the default voice of its language and the rate and volume of the first lane
+  (`lane_tts_config`); `WindowController` and `Pipeline.set_output_target` drop a voice name on a
+  language change (it belongs to the old language) and keep rate and volume.
+  *Missing voices are problems, not a banner.* `Wiring.problems` also asks SAPI (`check_voices`,
+  one question per target and voice name) and returns one message per target, for example
+  `voice missing: no SAPI voice for language 'fr'. Installed voices: ... Install the language pack
+  with text-to-speech (...), then restart the program.`; a COM failure is
+  `speech synthesis unavailable for <target>: ...`. The controller treats them like missing models:
+  inline list, Connect refused, apply refused before anything stops, a language change in standby
+  re-checks, and the window and the other settings keep working. A running lane that is switched
+  to a language without a voice fails in `set_output_target` before the old lane is touched (the
+  `build` check is the same cached question). `tts_notice` stays in the `Wiring` protocol and the
+  banner code in `app_tk.py` for any wiring that wants a notice; `RealWiring.tts_notice` is `None`.
+  *COM threading.* The Tk and worker threads never hold a COM object. `SapiTts` makes its backend
+  on the lane thread of the first sentence. `problems` (called by the controller on the Tk thread,
+  and by `build` on the worker) runs `check_voices` on a short-lived helper thread that is
+  joined (30 s limit): `ComVoiceBackend` initialises COM there, closes there, and the apartment
+  ends with the thread. Answers are cached under a separate lock (the model lock can be held
+  for seconds by a load), so only the first call per language blocks the Tk thread, about 0.6 s
+  for de and fr on the development machine; a COM failure is not cached and is asked again.
+  Installing a language pack needs a restart of the program, as the message says.
+  *Strict mode.* SAPI speaks into `SpMemoryStream` and the check only lists voices, so neither
+  writes or connects; WD17 runs the real check and a real sentence under the `no_disk_writes`
+  fixture (the real `StrictGuard`, English voice, no audio device). Audible playback through the
+  window on a speaker is not covered by any test (it needs the operator at the machine).
 - **Strict mode.** Tk, the clipboard and the controller use no sockets and write no files (WD13
   runs the whole window flow under `no_disk_writes` and `--disable-socket`); `--strict` therefore
   needs no exception for the window. Tk reads its own Tcl files, which the guard allows.
@@ -879,15 +915,21 @@ counter, so results do not depend on machine speed. All runs use
 | WD3 | Language options | unit | Supported, not the source, not used by another lane (own language always offered); labels round-trip |
 | WD4 | Snapshot formatting | unit | A word on every stage card, latency / drops / overflows / underruns on the right card, stream time format, transcript cells (time, pause, text, translations or `-`, processing), `[hidden]` keeps timings, columns follow the targets, summary line, level only if present, no utterance text outside the transcript cells |
 | WD5 | Settings form | unit | Texts from settings, typed values back (an untouched form rebuilds the same `Settings`), non-numbers refused per field, discard / reset / rebase (edits survive a baseline change), hints with range and unit, restart note per field and page, errors placed on fields (general ones apart, advanced ones flagged), real validation errors reach their fields. `test_ui_settings_form.py` |
-| WD6 | Controller standby | unit | Starts with no pipeline and everything idle, also with no device chosen; device scan on the worker; a failed scan is a notice; refresh re-initializes PortAudio only without a pipeline; missing models shown and connect refused; choices stored in standby; language rules as the pipeline's; output buttons need a running pipeline; hide text live; TTS banner from the wiring. `test_ui_controller.py` |
+| WD6 | Controller standby | unit | Starts with no pipeline and everything idle, also with no device chosen; device scan on the worker; a failed scan is a notice; refresh re-initializes PortAudio only without a pipeline; missing models shown and connect refused; choices stored in standby; language rules as the pipeline's; output buttons need a running pipeline; hide text live; the speech banner is whatever the wiring says (none for `RealWiring`); a language change in standby drops the voice name. `test_ui_controller.py` |
 | WD7 | Connect and device control | unit | Build and start on the worker (`lenient`), auto-connect, a microphone or build failure leaves a usable window and releases what the wiring made, absent outputs named in a warning, disconnect / connect of input and outputs and device switches off the UI thread, control errors become a notice, a language change rebuilds only that lane (session kept) and a failing one keeps the old lane |
 | WD8 | Apply and restart | unit | Invalid values return field keys at once; no change is a notice; `hide_text` is live; a restart setting stops, releases, builds, starts and swaps (new view-model, new generation, stop before build); run-time device and language choices and deliberate disconnects survive; a failed restart falls back to standby with the new settings; missing models refuse the apply before anything stops; standby only stores; nothing is accepted while busy |
 | WD9 | Worker, shutdown, report | unit | The tick never waits for the worker; busy label; `JobRunner` order, results, errors, close; shutdown stops and releases the pipeline, waits for a call in progress, is idempotent; errors described with their message; the placeholder device never reaches a pipeline; the report text for the clipboard honors hide text; the window can post a notice |
-| WD10 | Wiring | unit | Silent speech (silent, non-empty, 16 kHz, 200 ms to 4 s) and its resampler, banner text, missing models listed without loading, loaders get the right paths and settings, smart mode creates a link that `close` releases, a failing build releases it, whisper and translators are reused between builds and reloaded only when what they depend on changes, `with_config` passes new decode options, strict arms the guard after every load and otherwise releases it, glossary path, a built pipeline runs end to end on fakes (row with both translations, silent audio at the device rate, no lane error), controller connect and restart through the real wiring. `test_ui_wiring.py` |
-| WD11 | Real wiring on local models | model | `RealWiring` builds and starts on `models/` (tiny.en, fixed and smart mode) with fake streams. `test_ui_wiring_model.py` |
+| WD10 | Wiring | unit | The real loaders are SAPI and `RateConverter` (a lane without a route gets the default voice and the shared rate), no banner, a lane's engine is closed with the build and after a failed one, missing models listed without loading, loaders get the right paths and settings, smart mode creates a link that `close` releases, a failing build releases it, whisper and translators are reused between builds and reloaded only when what they depend on changes, `with_config` passes new decode options, strict arms the guard after every load and otherwise releases it, glossary path, a built pipeline runs end to end on fakes (row with both translations, a 440 Hz test tone at 22.05 kHz arrives at the 48 kHz device as 440 Hz through the real `RateConverter`, no lane error), controller connect and restart through the real wiring. `test_ui_wiring.py` |
+| WD11 | Real wiring on local models | model | `RealWiring` builds and starts on `models/` (tiny.en, fixed and smart mode) with fake streams, fake voices and fake speech. `test_ui_wiring_model.py` |
 | WD12 | Tk window smoke | unit | On a fake pipeline: standby look in words, connect, status dots and process cards, a transcript row filled in place, hide text, copy to the clipboard, a device button, inline settings errors, a restart clears the transcript, close stops the pipeline; advanced fields hidden until asked or until an error sits in one; missing model shown inline; no device selected; the language box reaches the pipeline; a control error in the status bar; no Tk call from the worker thread. Skips when Tk cannot open a window. `test_ui_tk.py` |
 | WD13 | Window and controller touch no disk or network | unit | The whole WD12 flow and the controller flows run under `no_disk_writes` and `--disable-socket`: 0 violations |
 | WD14 | Tk-free logic | unit | `present`, `controller`, `settings_form`, `wiring`, `model` and `settings_schema` import no toolkit (static scan) |
+| WD17 | Process layout | unit | Stage cards grouped into `ProcessLayout(common, lanes)`: two lanes after the common stages, one lane, no lanes, a missing translate or output card leaves a gap, lane order follows the snapshot, `keys()` lists every card key in signal order. `test_ui_present.py` |
+| WD18 | Process titles and fork | unit | Card titles say what the stage does and the language (`Microphone`, `Speech recognition (English)`, `Translate to German (de)`, `Speak / output de`; unknown code falls back to the code); `fork_geometry` gives one stem, one bar and one branch per lane, a straight line for one lane, nothing for none |
+| WD19 | Fork in the window | unit | Tk smoke: with two targets both lane rows are children of the one "In parallel" group and nothing else is, each row has exactly one arrow (translate to speak), no arrow links lanes, the connector has one stem, one bar and two branches, every card keeps its health word, a new tick keeps the same widgets; one target gives one row and a bar-less connector. `test_ui_tk.py` |
+| WD15 | Voices in `problems` and lane building | unit | All voices installed: no problem; one message per target without a voice (`voice missing: ...`, installed voices and the fix named, no `; ` inside); a voice name that matches nothing; voice and model problems together; the check loads no model, makes no engine, opens no audio; the backend is made, used and closed on one helper thread that is not the caller's; answers are cached per target and voice name (a rate change asks nothing) and a COM failure is a problem that is asked again; the check is not blocked by a model load in progress; `build` refuses a missing voice and releases the engines and the turn link it made; a lane switched to a language without a voice raises before the old lane is touched, one with a voice gets an engine that the build also closes; a language change drops the voice name and keeps rate and volume (`Pipeline.set_output_target` in `test_app.py`, standby in `test_ui_controller.py`). `test_ui_wiring.py` |
+| WD16 | The window with a missing voice | unit | Through the controller on the real wiring with fake voices: auto-connect and connect are refused with `Cannot start: voice missing: ...`, nothing is loaded, other settings are stored, devices are listed, no banner; a language change in standby re-checks (the old language's voice name does not follow) and recovers; a running session whose lane switch is refused stays up with an error notice and the same generation. In Tk: a missing voice shows inline in the problems banner, not in the speech banner, Connect is disabled and settings can still be applied; a wiring notice still shows the speech banner. `test_ui_wiring.py`, `test_ui_tk.py`, `test_ui_controller.py` |
+| WD17 | Real SAPI through the wiring | model | The real voice check (English) answers "no problem" and runs off the calling thread; a language without a voice is reported by the real check; the real check plus a real sentence under the `no_disk_writes` fixture: 0 violations. Memory streams only, no audio device. `test_tts_sapi_model.py` |
 | H1 | Live microphone | hw | V380 format detected; utterances chunked, transcribed and translated |
 | H2 | Pull the HS100W dongle | hw | Dongle out and in -> output B restored <= 3 s; input and output A uninterrupted; no crash |
 | H3 | Two physical outputs | hw | English on Realtek, German on HS100W at the same time; without HS100W the second language goes to output C (HDMI Q2713S) |
@@ -930,7 +972,7 @@ src/pipeline/
   ui/settings_form.py     settings tab state: texts, parsing, hints, error placement (no Tk)
   ui/present.py           strings, options and cell texts the window shows (no Tk)
   ui/controller.py        WindowController, JobRunner worker, standby / active sessions (no Tk)
-  ui/wiring.py            composition root: real loaders and caches, silent TTS placeholder (no Tk)
+  ui/wiring.py            composition root: real loaders and caches, SAPI speech and voice check (no Tk)
   ui/app_tk.py            MainWindow, run_gui (Tk)
   ui/transcript_view.py   transcript table (Tk)
   ui/settings_view.py     settings notebook (Tk)
@@ -983,6 +1025,26 @@ extension adds steps 1b, 2b, 9b, 10b, 11b and 12b (about 12.5 h); see
    after another. **V3 is written but not yet run**: it needs an elevated shell
    (`pnputil /restart-device`) and skips otherwise. T7 needs a second cable (A+B).
 8. Milestone 1 soak — S1, A1, A2 (1 h + 1 h run)
+   **Run 2026-11-08, S1 NOT passed.** `scripts/soak.py` (looped SAPI speech through the VB-Cable,
+   7 busy worker processes from `scripts/stress.py` at below-normal priority, `StrictGuard` armed,
+   silent until the report) and `scripts/netcheck.ps1` (A2) are written; the verdict logic has 33
+   unit tests in `tests/test_soak.py`. **60 min:** 0 input overflows, longest callback 3.88 ms,
+   RSS growth 0 MB/h, 698 chunks = the offline count, 0 reconnects, **A1: 0 write operations and
+   0 bytes** (Windows I/O counters of the process, not Process Monitor, which is not installed here),
+   **A2: 59 samples, 0 sockets**. **Failed:** 452 640 frames (about 9.4 s) lost from the capture
+   ring, one output underrun, p99 finalization latency 96 ms (max 1726 ms). A processing thread
+   that is not scheduled for over 2 s overflows the 2 s ring; the cause is not known (the run was
+   silent and other programs, including the parallel GUI work, shared the machine). **A 10 min
+   rerun with a per-minute timeline did not reproduce it:** 0 ring losses, 0 underruns, longest
+   callback 2.26 ms, but an idle thread of the process woke up to 278 ms late under the load.
+   **Finding, independent of the stall:** p99 finalization is 70-96 ms with real speech even on an
+   idle machine (30-48 ms for most chunks, 68-90 ms for those with a fading word end). The silence
+   clock starts at the first frame below `exit_threshold` while the metric counts from the last
+   frame above `speech_threshold`, and the frames between the two thresholds (1-2 frames of 32 ms)
+   are not silence; F5 uses a synthetic signal without that zone and passes. Either the criterion
+   is measured from the start of the silence clock, or the clock starts at the last speech frame
+   (shorter latency, but it changes segmentation and needs M1 and the endpointing evals again).
+   Open until decided; the 60 min run has to be repeated with `--progress` to catch the stall.
 9. `transcribe`, glossary — M2, T2, T3 (2 h)
    **Done 2026-11-08**: 692 unit tests green (+4 model tests for M2 / T3), ruff, mypy, licenses
    and English check clean; `transcribe.py` 93%, `glossary.py` 96% covered. Dependencies added:
@@ -1023,16 +1085,16 @@ extension adds steps 1b, 2b, 9b, 10b, 11b and 12b (about 12.5 h); see
    **23-40 ms** against the 300 ms target; the German and French voices needed the Windows
    language packs (no pack: the tests skip with the reason). New runtime dependency `comtypes`
    1.4.17 (MIT). Flags `--tts-rate` (-10..10, every lane) and `--tts-voice de=Hedda,fr=Hortense`
-   fill `LaneRoute.tts`. **Not yet wired:** the operator window (`ui/wiring.py`) still passes the
-   silent placeholder; switching it to `sapi_tts_factory` and `RateConverter` is a small change
-   in the wiring, left to the GUI work. The G1 fixture watches Python-level opens only; that SAPI
+   fill `LaneRoute.tts`. The operator window (`ui/wiring.py`) passes `sapi_tts_factory` and
+   `RateConverter` and reports missing voices through `problems` (section 7, WD10, WD15-WD17);
+   audible playback through the window was not verified by hand. The G1 fixture watches Python-level opens only; that SAPI
    writes nothing is by construction (`SpMemoryStream`).
 12. Latency and hardware — T6-T8, H1-H3, S2 (2 h + 1 h run)
 13. Video and README (1.5 h)
 
 GUI plan (operator window, outside the numbered steps): the orchestrator `app.py`, the view-model,
 the settings schema and the Tk window with the `gui` command are implemented (section 7, WD1-WD14).
-The window runs on a silent TTS placeholder until step 11 provides the SAPI engine.
+The window speaks with the SAPI voices through the same engine the CLI will use (section 7).
 
 ## 12. Video script (~2 min)
 

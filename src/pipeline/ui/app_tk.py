@@ -6,9 +6,11 @@ Anything slow (opening a device, loading a model, a restart) runs on the control
 thread; pipeline threads never see a widget. The window never opens a dialog, never writes a
 file and never uses the network: the report goes to the clipboard and nothing else.
 
-Layout, top to bottom: banners (silent speech, missing models), the *Interpreter* page (input,
-outputs, process strip, transcript with its summary) and the *Settings* page in a notebook, and
-a status bar with the busy state and the latest message.
+Layout, top to bottom: banners (a speech notice, missing models and voices), the *Interpreter*
+page (input, outputs, process strip, transcript with its summary) and the *Settings* page in a
+notebook, and a status bar with the busy state and the latest message. The process strip is a
+fork: microphone and recognition in one row, then one row per language in an "In parallel" box
+(every lane gets each utterance at the same time).
 """
 
 from __future__ import annotations
@@ -39,6 +41,9 @@ _POLL_MS = 200  # the view-model is meant to be polled every 100-250 ms
 _FONT_SIZE = 10
 _CARD_WRAP_PX = 170
 _ERROR_PREVIEW_CHARS = 90
+_FORK_WIDTH_PX = 36
+_FORK_COLOR = "#555555"
+_STRIP_MAX_COLUMNS = 12
 
 
 def _shorten(text: str) -> str:
@@ -72,6 +77,25 @@ class _StageCard:
         self.status.configure(text=f"{card.word}: {card.detail}")
         self.metrics.configure(text=card.metrics)
         self.shown = card
+
+
+class _LaneRow:
+    """One language lane of the fork: label, translate card, arrow, speak / output card."""
+
+    def __init__(self, parent: tk.Misc, row: int, lane: present.LaneCards) -> None:
+        self.target = lane.target
+        self.frame = ttk.Frame(parent)
+        self.frame.grid(row=row, column=0, sticky="ew", pady=3)
+        self.frame.columnconfigure(1, weight=1, uniform="lane")
+        self.frame.columnconfigure(3, weight=1, uniform="lane")
+        self.label = ttk.Label(self.frame, text=present.language_label(lane.target), width=12)
+        self.label.grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.translate = _StageCard(self.frame)
+        self.translate.frame.grid(row=0, column=1, sticky="ew")
+        # The only arrow of a lane: translation feeds speech inside this lane, never another one.
+        ttk.Label(self.frame, text="→").grid(row=0, column=2, padx=4)
+        self.output = _StageCard(self.frame)
+        self.output.frame.grid(row=0, column=3, sticky="ew")
 
 
 class _OutputRow:
@@ -135,6 +159,11 @@ class MainWindow:
         self._notice_seq_shown = -1
         self._card_keys: tuple[str, ...] = ()
         self._cards: dict[str, _StageCard] = {}
+        self._common_cards: list[_StageCard] = []
+        self._lane_rows: list[_LaneRow] = []
+        self._lane_group: ttk.LabelFrame | None = None
+        self._fork: tk.Canvas | None = None
+        self._fork_drawn: tuple[int, tuple[int, ...]] | None = None
         self._outputs: list[_OutputRow] = []
         self._input_names: tuple[str, ...] = ()
         self._input_enabled: bool | None = None
@@ -282,7 +311,7 @@ class MainWindow:
 
     @property
     def tts_banner_text(self) -> str:
-        """The silent-speech banner, empty while hidden."""
+        """The speech banner (a wiring's notice), empty while hidden."""
         return str(self._tts_banner.cget("text")) if self._tts_banner.winfo_manager() else ""
 
     @property
@@ -291,6 +320,26 @@ class MainWindow:
         return (
             str(self._problem_banner.cget("text")) if self._problem_banner.winfo_manager() else ""
         )
+
+    @property
+    def common_cards(self) -> tuple[_StageCard, ...]:
+        """The cards of the left part (microphone, recognition), in signal order."""
+        return tuple(self._common_cards)
+
+    @property
+    def lane_group(self) -> ttk.LabelFrame | None:
+        """The "In parallel" box holding the lane rows; ``None`` with no lanes."""
+        return self._lane_group
+
+    @property
+    def lane_rows(self) -> tuple[_LaneRow, ...]:
+        """The lane rows, top to bottom, in the snapshot's order."""
+        return tuple(self._lane_rows)
+
+    @property
+    def fork(self) -> tk.Canvas | None:
+        """The connector from recognition to the lane rows; ``None`` with no lanes."""
+        return self._fork
 
     def stage_words(self) -> dict[str, str]:
         """The health word shown on each process card."""
@@ -334,7 +383,7 @@ class MainWindow:
         else:
             self._tts_banner.pack_forget()
         if state.problems:
-            lines = ["The pipeline cannot start: files are missing."]
+            lines = ["The pipeline cannot start: models or voices are missing."]
             lines.extend(f"  {problem}" for problem in state.problems)
             self._problem_banner.configure(text="\n".join(lines))
             self._problem_banner.pack(fill="x", pady=(0, 4))
@@ -428,22 +477,95 @@ class MainWindow:
             )
 
     def _render_process(self, snapshot: Snapshot) -> None:
-        cards = present.stage_cards(snapshot)
-        keys = tuple(card.key for card in cards)
+        layout = present.process_layout(snapshot)
+        keys = layout.keys()
         if keys != self._card_keys:
-            for child in self._strip.winfo_children():
-                child.destroy()
-            self._cards = {}
-            for index, card in enumerate(cards):
-                if index:
-                    ttk.Label(self._strip, text="→").grid(row=0, column=index * 2 - 1)
-                widget = _StageCard(self._strip)
-                widget.frame.grid(row=0, column=index * 2, sticky="nsew")
-                self._strip.columnconfigure(index * 2, weight=1, uniform="stage")
-                self._cards[card.key] = widget
+            self._build_strip(layout)
             self._card_keys = keys
-        for card in cards:
-            self._cards[card.key].update(card)
+        for card, widget in zip(layout.common, self._common_cards, strict=True):
+            widget.update(card)
+        for lane, row in zip(layout.lanes, self._lane_rows, strict=True):
+            if lane.translate is not None:
+                row.translate.update(lane.translate)
+            if lane.output is not None:
+                row.output.update(lane.output)
+
+    def _build_strip(self, layout: present.ProcessLayout) -> None:
+        """Common cards in one row, then the fork into a group with one row per language."""
+        for child in self._strip.winfo_children():
+            child.destroy()
+        for column in range(_STRIP_MAX_COLUMNS):
+            self._strip.columnconfigure(column, weight=0, uniform="")
+        self._cards = {}
+        self._common_cards = []
+        self._lane_rows = []
+        self._lane_group = None
+        self._fork = None
+        self._fork_drawn = None
+        column = 0
+        for index, card in enumerate(layout.common):
+            if index:
+                ttk.Label(self._strip, text="→").grid(row=0, column=column)
+                column += 1
+            widget = _StageCard(self._strip)
+            widget.frame.grid(row=0, column=column, sticky="ew")
+            self._strip.columnconfigure(column, weight=1, uniform="stage")
+            self._common_cards.append(widget)
+            self._cards[card.key] = widget
+            column += 1
+        if not layout.lanes:
+            return
+        background = str(ttk.Style(self._root).lookup("TFrame", "background") or "SystemButtonFace")
+        self._fork = tk.Canvas(
+            self._strip, width=_FORK_WIDTH_PX, height=1, highlightthickness=0, bg=background
+        )
+        self._fork.grid(row=0, column=column, sticky="ns", padx=2)
+        self._fork.bind("<Configure>", self._draw_fork)
+        group = ttk.LabelFrame(self._strip, text="In parallel", padding=(8, 2, 8, 6))
+        group.grid(row=0, column=column + 1, sticky="nsew")
+        group.columnconfigure(0, weight=1)
+        group.bind("<Configure>", self._draw_fork)
+        self._strip.columnconfigure(column + 1, weight=3)
+        self._lane_group = group
+        for index, lane in enumerate(layout.lanes):
+            row = _LaneRow(group, index, lane)
+            self._lane_rows.append(row)
+            if lane.translate is not None:
+                self._cards[lane.translate.key] = row.translate
+            if lane.output is not None:
+                self._cards[lane.output.key] = row.output
+        self._draw_fork()
+
+    def _draw_fork(self, event: tk.Event | None = None) -> None:
+        """Draw the stem, bar and one branch per lane; redrawn only when the rows moved."""
+        canvas = self._fork
+        if canvas is None or not self._lane_rows:
+            return
+        count = len(self._lane_rows)
+        if canvas.winfo_ismapped():
+            top = canvas.winfo_rooty()
+            ys = tuple(
+                row.frame.winfo_rooty() - top + row.frame.winfo_height() // 2
+                for row in self._lane_rows
+            )
+        else:  # not laid out (hidden window): the rows share the group's height evenly
+            height = max(1, self._lane_group_height())
+            ys = tuple(int((index + 0.5) * height / count) for index in range(count))
+        if self._fork_drawn == (_FORK_WIDTH_PX, ys):
+            return
+        self._fork_drawn = (_FORK_WIDTH_PX, ys)
+        canvas.delete("all")
+        geometry = present.fork_geometry(width_px=_FORK_WIDTH_PX, lane_ys=ys)
+        if geometry.stem is not None:
+            canvas.create_line(*geometry.stem, tags="stem", fill=_FORK_COLOR, width=2)
+        if geometry.bar is not None:
+            canvas.create_line(*geometry.bar, tags="bar", fill=_FORK_COLOR, width=2)
+        for branch in geometry.branches:
+            canvas.create_line(*branch, tags="branch", fill=_FORK_COLOR, width=2, arrow="last")
+
+    def _lane_group_height(self) -> int:
+        group = self._lane_group
+        return 0 if group is None else group.winfo_reqheight()
 
     def _render_status(self, state: WindowState) -> None:
         if state.busy != self._busy_shown:

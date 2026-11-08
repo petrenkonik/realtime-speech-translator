@@ -29,6 +29,7 @@ from pipeline.devices import DeviceInfo, DeviceNotFoundError
 from pipeline.lanes import Speech, Translation
 from pipeline.output import OutputConfig
 from pipeline.transcribe import Utterance
+from pipeline.tts_sapi import TtsConfig
 from pipeline.vad import Float32Array, Segmenter, SegmenterConfig, VadStage
 
 pytestmark = pytest.mark.unit
@@ -113,12 +114,16 @@ class Rig:
 
 
 def settings_for(
-    input_query: str = "V380", routes: tuple[tuple[str, str], ...] = (("de", "Realtek"),)
+    input_query: str = "V380",
+    routes: tuple[tuple[str, str], ...] = (("de", "Realtek"),),
+    tts: TtsConfig | None = None,
 ) -> Settings:
     return Settings(
         capture=CaptureConfig(input_query, watchdog_ms=HUGE_WATCHDOG_MS),
         routes=tuple(
-            LaneRoute(target, OutputConfig(query, watchdog_ms=HUGE_WATCHDOG_MS))
+            LaneRoute(
+                target, OutputConfig(query, watchdog_ms=HUGE_WATCHDOG_MS), tts=tts or TtsConfig()
+            )
             for target, query in routes
         ),
         targets=tuple(target for target, _ in routes),
@@ -129,6 +134,7 @@ def settings_for(
 def build(
     routes: tuple[tuple[str, str], ...] = (("de", "Realtek"), ("fr", "HS100W")),
     extra_devices: tuple[DeviceInfo, ...] = (),
+    tts: TtsConfig | None = None,
 ) -> Rig:
     broken_models: set[str] = set()
     clock = FakeClock()
@@ -160,7 +166,7 @@ def build(
         return translators[target]
 
     pipeline = Pipeline(
-        settings_for(routes=routes),
+        settings_for(routes=routes, tts=tts),
         devices=devices,
         input_stream_factory=input_factory,
         output_stream_factory=output_factory,
@@ -697,6 +703,15 @@ def started(routes: tuple[tuple[str, str], ...]) -> Rig:
     built = build(routes=routes)
     built.pipeline.start()
     return built
+
+
+def test_wd15_a_lane_that_changes_language_drops_the_voice_name_but_keeps_rate_and_volume() -> None:
+    built = build(routes=(("de", "Realtek"),), tts=TtsConfig(rate=3, volume=80, voice="Hedda"))
+    try:
+        built.pipeline.set_output_target("de", "fr")
+        assert built.pipeline.settings.routes[0].tts == TtsConfig(rate=3, volume=80, voice=None)
+    finally:
+        built.pipeline.stop()
 
 
 def test_p16_a_running_lane_changes_language_on_the_same_output() -> None:
