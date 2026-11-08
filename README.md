@@ -61,6 +61,8 @@ measurements do not depend on machine speed.
 
 ### What a session looks like (measured run, 2026-11-08)
 
+![The control window: stage tiles, transcript with pauses and per-utterance processing times](docs/img/app-interpreter.jpg)
+
 Machine: AMD Ryzen 5 2400G (4 cores / 8 threads, Zen 1), Windows 10, other
 applications running — absolute numbers are pessimistic. English speech into a
 USB headset, one German lane on the same headset, `base.en`, 51 s stream,
@@ -154,6 +156,8 @@ which of them the segmenter cuts, what Smart Turn answers during each pause
 and where it would cut early, the energy-based reference labels, the inserted
 silence (synthetic streams only) and the text — plus a comparison table of
 fixed vs smart over all clips.
+
+![The pause viewer: one real LibriSpeech clip with pauses, Smart Turn answers and reference labels](docs/img/pause-viewer.jpg)
 
 - Open: [data/pause_viewer.html](data/pause_viewer.html) in a browser. The
   page is generated on your machine and is not committed: `data/` is ignored
