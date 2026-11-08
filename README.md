@@ -147,8 +147,10 @@ inside continuous speech, latency = decision time after the phrase end):
 | smart 600 ms, check 150 ms | 56% | 51% | 31% | 499 / 720 ms |
 
 Longer silence trades recall for fewer premature cuts; smart mode cuts a bit
-earlier and recovers some recall at the same `silence_ms`. Full data:
-`data/endpointing_results.json` (13 configurations with 95% CIs).
+earlier and recovers some recall at the same `silence_ms`. The full measured
+comparison — all 13 configurations with confidence intervals, recall by pause
+length, and the 128-configuration silence-rule sweep on two seeds — is in
+[docs/ENDPOINTING-COMPARISON.md](docs/ENDPOINTING-COMPARISON.md).
 
 **Pause viewer.** An offline page shows, per clip, aligned tracks: the
 waveform, the Silero probability with both thresholds, the pauses found and
@@ -214,7 +216,8 @@ Rules for contributors and AI agents live in [CLAUDE.md](CLAUDE.md).
 Project agents are in `.claude/agents/`, project skills in `.claude/skills/`.
 Specifications: [docs/SPEC.md](docs/SPEC.md) (base),
 [docs/SPEC-LOW-LATENCY.md](docs/SPEC-LOW-LATENCY.md) (latency extension),
-[docs/SMART-TURN-MODEL-COMPARISON.md](docs/SMART-TURN-MODEL-COMPARISON.md).
+[docs/SMART-TURN-MODEL-COMPARISON.md](docs/SMART-TURN-MODEL-COMPARISON.md),
+[docs/ENDPOINTING-COMPARISON.md](docs/ENDPOINTING-COMPARISON.md).
 
 ## License
 
