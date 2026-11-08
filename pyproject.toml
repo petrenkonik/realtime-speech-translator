@@ -1,0 +1,105 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pipeline"
+version = "0.1.0"
+description = "Offline real-time interpreter demo: one microphone, many languages, zero network, zero disk."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "petrenkonik" }]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: Microsoft :: Windows",
+]
+# Runtime dependencies are added by the work-plan step that first needs them.
+dependencies = [
+    "comtypes==1.4.17",
+    "ctranslate2==4.8.5",
+    "faster-whisper==1.2.1",
+    "numpy==2.4.6",
+    "onnxruntime==1.31.1",
+    "rich==15.0.0",
+    "scipy==1.17.1",
+    "sentencepiece==0.2.1",
+    "sounddevice==0.5.6",
+]
+
+# faster-whisper declares PyAV (`av`), whose wheel ships FFmpeg DLLs that include LGPL code
+# (libmp3lame, opencore-amr). This project never decodes files (it passes float32 arrays), so
+# `av` is dropped from the resolution and `pipeline.transcribe` installs a stub module that
+# fails loudly if anything tries to decode a file. With plain pip use
+# `pip install --no-deps faster-whisper==1.2.1` after installing the rest.
+[tool.uv]
+override-dependencies = ["av; sys_platform == 'never'"]
+
+[project.optional-dependencies]
+dev = [
+    "mypy==2.4.1",
+    "pip-licenses==5.5.5",
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+    "pytest-socket==0.8.1",
+    "ruff==0.17.4",
+    # Decodes LibriSpeech FLAC for scripts/eval_endpointing.py only (MIT). Never used by src/.
+    "miniaudio==1.72",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pipeline"]
+
+# --- ruff ---------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["models"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "SIM", "PT", "ANN", "D",
+    "RUF",  # RUF001-RUF003 flag look-alike Unicode (English-only rule)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "ANN"]
+"scripts/**" = ["D"]
+
+# --- mypy ---------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+cache_dir = "nul"  # keep type checks free of disk writes like the runtime
+
+[[tool.mypy.overrides]]
+module = [
+    "scipy", "scipy.*", "onnxruntime", "onnxruntime.*", "sounddevice",
+    "faster_whisper", "faster_whisper.*", "ctranslate2", "ctranslate2.*",
+    "sentencepiece", "sentencepiece.*", "comtypes", "comtypes.*",
+]
+ignore_missing_imports = true
+
+# --- pytest -------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers -p no:cacheprovider --disable-socket"
+markers = [
+    "unit: no hardware, no models; runs in CI",
+    "model: needs models/ from scripts/fetch_models.py; runs in CI",
+    "virtual: needs VB-Cable A+B",
+    "hw: needs V380 + Realtek + HS100W and a person present",
+    "soak: 60-minute run",
+]
+
+[tool.coverage.run]
+source = ["pipeline"]
+branch = true

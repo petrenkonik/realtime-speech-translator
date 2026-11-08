@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pause viewer</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #5d6879; --line: #d5dae3;
+    --wave: #3b6fb6; --prob: #1d7a5a; --thr-speech: #b5651d; --thr-exit: #8a6d00;
+    --pause: #d98a2b; --pause-cut: #c0392b; --energy: #6c4bb5; --known: #0a8a8a; --turn: #c2185b;
+    --text-box: #eef1f6; --sel: rgba(59, 111, 182, 0.18); --cursor: #1c2330; --play: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12161d; --panel: #1a2029; --ink: #e6e9ef; --muted: #98a3b5; --line: #2c3544;
+      --wave: #6aa0e8; --prob: #4cc79a; --thr-speech: #e0955a; --thr-exit: #d1b24a;
+      --pause: #e0a04a; --pause-cut: #ef6b5b; --energy: #a98af0; --known: #3cc5c5; --turn: #f06fa4;
+      --text-box: #232b38; --sel: rgba(106, 160, 232, 0.22); --cursor: #e6e9ef; --play: #ef6b5b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 20px 8px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); max-width: 960px; }
+  main { display: grid; grid-template-columns: 220px 1fr; gap: 14px; padding: 8px 20px 28px; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+  #clips { padding: 6px; max-height: 80vh; overflow: auto; }
+  #clips button { display: block; width: 100%; text-align: left; margin: 2px 0; padding: 7px 9px;
+    border: 1px solid transparent; border-radius: 6px; background: none; color: var(--ink);
+    font: inherit; cursor: pointer; }
+  #clips button:hover { background: var(--text-box); }
+  #clips button[aria-current="true"] { border-color: var(--wave); background: var(--text-box); }
+  .badge { font-size: 11px; color: var(--muted); }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px;
+             border-bottom: 1px solid var(--line); }
+  .toolbar button { font: inherit; padding: 5px 12px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--panel); color: var(--ink); cursor: pointer; }
+  .toolbar button:hover { border-color: var(--wave); }
+  #readout { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums;
+             min-width: 280px; text-align: right; }
+  #scroller { overflow-x: auto; position: relative; }
+  #stack { position: relative; }
+  .row { display: flex; border-bottom: 1px solid var(--line); }
+  .label { position: sticky; left: 0; z-index: 3; flex: 0 0 150px; padding: 8px 10px;
+           background: var(--panel); border-right: 1px solid var(--line); font-size: 12px;
+           color: var(--muted); }
+  .label b { color: var(--ink); display: block; font-size: 13px; }
+  canvas { display: block; }
+  #overlay { position: absolute; top: 0; bottom: 0; left: 150px; z-index: 2; cursor: crosshair; }
+  #cursor, #playhead { position: absolute; top: 0; bottom: 0; width: 1px; pointer-events: none; }
+  #cursor { background: var(--cursor); opacity: 0.6; }
+  #playhead { background: var(--play); width: 2px; display: none; }
+  #selection { position: absolute; top: 0; bottom: 0; background: var(--sel); display: none;
+               pointer-events: none; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; padding: 8px 12px; color: var(--muted);
+            font-size: 12px; border-top: 1px solid var(--line); }
+  .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px;
+        vertical-align: -2px; margin-right: 5px; }
+  h2 { font-size: 14px; margin: 0; padding: 10px 12px 6px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 5px 12px; border-top: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--text-box); }
+  .cut { color: var(--pause-cut); font-weight: 600; }
+  .segs { padding: 0 12px 12px; }
+  .seg { margin: 6px 0; padding: 7px 10px; background: var(--text-box); border-radius: 6px;
+         cursor: pointer; }
+  .seg small { color: var(--muted); }
+  .mode-label { color: var(--muted); font-size: 12px; }
+  .toolbar button[aria-pressed="true"] { border-color: var(--wave); background: var(--text-box); }
+  #listen-status { color: var(--ink); font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Pause viewer</h1>
+  <div class="sub">Silero speech probability, the pauses found from it, and where the segmenter
+  actually cuts, next to the reference labels. Click to place the cursor, drag to select, press
+  Space to play the selection (or from the cursor). Ctrl + wheel zooms. Listen mode plays one
+  pause, cut or chunk at a time, with a beep at each cut; Left/Right arrows step through them.</div>
+</header>
+<section class="panel" id="compare" style="margin:8px 20px 0">
+  <h2>Comparison of two models: Silero timer vs Silero + Smart Turn</h2>
+  <div class="sub" id="compare-note" style="padding:0 12px 8px"></div>
+  <table>
+    <thead><tr id="compare-head"></tr></thead>
+    <tbody id="compare-body"></tbody>
+  </table>
+</section>
+<main>
+  <div class="panel" id="clips"></div>
+  <div>
+    <div class="panel">
+      <div class="toolbar">
+        <button id="play">Play</button>
+        <button id="zoom-out">Zoom out</button>
+        <button id="zoom-in">Zoom in</button>
+        <button id="fit">Fit</button>
+        <span id="readout">move over a track</span>
+      </div>
+      <div class="toolbar" id="listen">
+        <span class="mode-label">Listen to</span>
+        <button type="button" data-mode="pauses" aria-pressed="true">Pauses</button>
+        <button type="button" data-mode="cuts" aria-pressed="false">Cuts</button>
+        <button type="button" data-mode="chunks" aria-pressed="false">Chunks</button>
+        <button type="button" id="prev">Prev</button>
+        <button type="button" id="play-item">Play</button>
+        <button type="button" id="next">Next</button>
+        <button type="button" id="play-all">Play all</button>
+        <label class="mode-label"><input type="checkbox" id="repeat"> Repeat</label>
+        <span id="listen-status"></span>
+      </div>
+      <div id="scroller"><div id="stack"></div></div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h2>Pauses found from the probability</h2>
+      <div class="sub" id="summary" style="padding:0 12px 8px"></div>
+      <table>
+        <thead><tr id="pause-head"></tr></thead>
+        <tbody id="pause-body"></tbody>
+      </table>
+    </div>
+    <div class="panel" style="margin-top:14px">
+      <h2>Text</h2>
+      <div class="segs" id="segs"></div>
+    </div>
+  </div>
+</main>
+<script>
+"use strict";
+const D = /*__DATA__*/null;
+const LABEL_W = 150;
+const FRAME_MS = D.frame_samples * 1000 / D.rate_hz;
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+let clip = null, pcm = null, pxPerSec = 120, cursorSec = 0, selection = null;
+let audioCtx = null, source = null, playStart = 0, playOffset = 0, playing = false, raf = 0;
+
+function decode(b64) {
+  const bin = atob(b64), view = new DataView(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) view.setUint8(i, bin.charCodeAt(i));
+  const out = new Float32Array(bin.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = view.getInt16(i * 2, true) / 32768;
+  return out;
+}
+const durationSec = () => clip.samples / D.rate_hz;
+const xOf = (sec) => sec * pxPerSec;
+const secOfSample = (s) => s / D.rate_hz;
+const frameSec = (f) => f * D.frame_samples / D.rate_hz;
+const fmt = (sec) => sec.toFixed(2) + " s";
+const pauseMs = (p) => (p.end - p.start) * FRAME_MS;
+
+/* ---- tracks: each draws into its own canvas at the shared time scale ---- */
+function drawWave(c, w, h) {
+  const mid = h / 2, per = pcm.length / w;
+  c.fillStyle = css("--wave");
+  for (let x = 0; x < w; x++) {
+    let lo = 0, hi = 0;
+    const a = Math.floor(x * per), b = Math.min(pcm.length, Math.floor((x + 1) * per));
+    for (let i = a; i < b; i++) { const v = pcm[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    c.fillRect(x, mid - hi * mid * 0.95, 1, Math.max(1, (hi - lo) * mid * 0.95));
+  }
+}
+function shadePauses(c, h, strong) {
+  for (const p of clip.pauses) {
+    const cut = p.cut !== null;
+    c.fillStyle = (cut ? css("--pause-cut") : css("--pause")) + (strong ? "40" : "22");
+    c.fillRect(xOf(frameSec(p.start)), 0, xOf(frameSec(p.end - p.start)), h);
+  }
+}
+function drawProb(c, w, h) {
+  shadePauses(c, h, false);
+  const y = (p) => h - 6 - p * (h - 14);
+  c.setLineDash([5, 4]); c.lineWidth = 1;
+  for (const [v, col] of [[D.speech_threshold, "--thr-speech"], [D.exit_threshold, "--thr-exit"]]) {
+    c.strokeStyle = css(col); c.beginPath(); c.moveTo(0, y(v)); c.lineTo(w, y(v)); c.stroke();
+    c.fillStyle = css(col); c.font = "11px system-ui"; c.fillText(v.toFixed(2), 3, y(v) - 3);
+  }
+  c.setLineDash([]); c.lineWidth = 1.5; c.strokeStyle = css("--prob"); c.beginPath();
+  clip.probs.forEach((p, i) => {
+    const x0 = xOf(frameSec(i)), x1 = xOf(frameSec(i + 1));
+    if (i === 0) c.moveTo(x0, y(p)); else c.lineTo(x0, y(p));
+    c.lineTo(x1, y(p));
+  });
+  c.stroke();
+}
+function drawPauses(c, w, h) {
+  c.font = "11px system-ui"; c.textBaseline = "middle";
+  for (const p of clip.pauses) {
+    const x = xOf(frameSec(p.start)), pw = xOf(frameSec(p.end - p.start)), ms = pauseMs(p);
+    const cut = p.cut !== null, col = cut ? css("--pause-cut") : css("--pause");
+    c.fillStyle = col + "55"; c.fillRect(x, 8, pw, h - 16);
+    c.strokeStyle = col; c.lineWidth = 1.5; c.strokeRect(x + 0.5, 8.5, pw - 1, h - 17);
+    c.fillStyle = css("--ink");
+    const label = Math.round(ms) + " ms" + (p.open ? " (to end)" : "");
+    if (c.measureText(label).width < pw - 6) c.fillText(label, x + 4, h / 2);
+  }
+  for (const f of clip.cuts) {
+    const x = xOf(frameSec(f)); // speech_end_sample / frame size: the end of the last speech frame
+    c.strokeStyle = css("--pause-cut"); c.lineWidth = 2; c.setLineDash([]);
+    c.beginPath(); c.moveTo(x, 0); c.lineTo(x, h); c.stroke();
+  }
+}
+function drawTurn(c, w, h) {
+  c.font = "11px system-ui"; c.textBaseline = "middle";
+  if (!clip.turn) {
+    c.fillStyle = css("--muted");
+    c.fillText("Smart Turn model not found when the page was built", 8, h / 2);
+    return;
+  }
+  const y = (p) => h - 8 - p * (h - 20), turn = css("--turn");
+  const base = clip.turn.probes.find((q) => q.kind === "turn");
+  if (base) {
+    c.setLineDash([5, 4]); c.lineWidth = 1; c.strokeStyle = turn;
+    c.beginPath(); c.moveTo(0, y(base.threshold)); c.lineTo(w, y(base.threshold)); c.stroke();
+    c.fillStyle = turn; c.fillText(base.threshold.toFixed(2), 3, y(base.threshold) - 7);
+    c.setLineDash([]);
+  }
+  // Cuts first, so the answer dots stay on top.
+  for (const cut of clip.turn.cuts) {
+    const early = cut.reason === "turn" || cut.reason === "soft";
+    c.strokeStyle = early ? turn : css("--muted"); c.lineWidth = early ? 2 : 1;
+    c.setLineDash(early ? [] : [3, 3]);
+    const x = xOf(frameSec(cut.frame));
+    c.beginPath(); c.moveTo(x, 0); c.lineTo(x, h); c.stroke(); c.setLineDash([]);
+    c.fillStyle = early ? turn : css("--muted");
+    c.fillText(cut.reason, x + 4, 8);
+  }
+  let previous = null;
+  for (const q of clip.turn.probes) {
+    const x = xOf(frameSec(q.frame)), reached = q.p >= q.threshold;
+    if (previous && q.frame - previous.frame <= 8) {
+      c.strokeStyle = turn; c.lineWidth = 1;
+      c.beginPath(); c.moveTo(xOf(frameSec(previous.frame)), y(previous.p)); c.lineTo(x, y(q.p)); c.stroke();
+    }
+    c.beginPath(); c.arc(x, y(q.p), 4, 0, Math.PI * 2);
+    c.fillStyle = reached ? turn : css("--panel"); c.fill();
+    c.strokeStyle = turn; c.lineWidth = 1.5; c.stroke();
+    c.fillStyle = css("--ink");
+    c.fillText(q.p.toFixed(2), x + 7, y(q.p) + (q.p > 0.5 ? 10 : -9));
+    previous = q;
+  }
+}
+function drawRuns(c, w, h, runs, color, label) {
+  c.font = "11px system-ui"; c.textBaseline = "middle";
+  for (const [a, b] of runs) {
+    const x = xOf(secOfSample(a)), rw = xOf(secOfSample(b - a));
+    c.fillStyle = color + "66"; c.fillRect(x, 6, rw, h - 12);
+    c.strokeStyle = color; c.lineWidth = 1; c.strokeRect(x + 0.5, 6.5, rw - 1, h - 13);
+    const ms = Math.round((b - a) * 1000 / D.rate_hz) + " ms";
+    c.fillStyle = css("--ink");
+    if (c.measureText(ms).width < rw - 6) c.fillText(ms, x + 4, h / 2);
+  }
+}
+function drawEnergy(c, w, h) { drawRuns(c, w, h, clip.energy_runs, css("--energy")); }
+function drawKnown(c, w, h) {
+  const runs = clip.known_pauses.map((k) => [k.start, k.end]);
+  drawRuns(c, w, h, runs, css("--known"));
+  if (!runs.length) {
+    c.fillStyle = css("--muted"); c.font = "12px system-ui"; c.textBaseline = "middle";
+    c.fillText("real recording: no inserted silence", 8, h / 2);
+  }
+}
+function wrap(c, text, maxW) {
+  const lines = []; let line = "";
+  for (const word of text.split(" ")) {
+    const t = line ? line + " " + word : word;
+    if (c.measureText(t).width > maxW && line) { lines.push(line); line = word; } else line = t;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+function drawText(c, w, h) {
+  c.font = "12px system-ui"; c.textBaseline = "top";
+  for (const s of clip.segments) {
+    const x = xOf(secOfSample(s.start)), sw = xOf(secOfSample(s.end - s.start));
+    c.fillStyle = css("--text-box"); c.fillRect(x, 4, sw, h - 8);
+    c.strokeStyle = css("--line"); c.strokeRect(x + 0.5, 4.5, sw - 1, h - 9);
+    c.fillStyle = css("--muted"); c.fillText(s.kind, x + 4, 7);
+    c.fillStyle = css("--ink");
+    const lines = wrap(c, s.text, Math.max(20, sw - 8));
+    const room = Math.floor((h - 34) / 15);
+    lines.slice(0, room).forEach((ln, i) => c.fillText(
+      i === room - 1 && lines.length > room ? ln + " ..." : ln, x + 4, 22 + i * 15));
+  }
+}
+
+const TRACKS = [
+  { label: "Waveform", note: "16 kHz mono", h: 110, draw: drawWave },
+  { label: "Silero probability", note: "per 32 ms frame", h: 120, draw: drawProb },
+  { label: "Pauses", note: "red line = segmenter cut", h: 52, draw: drawPauses },
+  { label: "Smart Turn", note: "pipecat-ai model, asked during a pause", h: 96, draw: drawTurn },
+  { label: "Energy labels", note: "tests/endpointing_eval", h: 44, draw: drawEnergy },
+  { label: "Inserted silence", note: "known, synthetic only", h: 44, draw: drawKnown },
+  { label: "Text", note: "per segment, no word timing", h: 120, draw: drawText },
+];
+
+function renderLegend() {
+  const items = [
+    ["--wave", "waveform"], ["--prob", "Silero probability"],
+    ["--thr-speech", "speech threshold " + D.speech_threshold],
+    ["--thr-exit", "exit threshold " + D.exit_threshold],
+    ["--pause", "pause without a cut"],
+    ["--pause-cut", "pause where the segmenter cuts (silence_ms " + D.silence_ms + ")"],
+    ["--turn", "Smart Turn answer (filled = reaches its threshold) and early cut"],
+    ["--energy", "energy-based label"], ["--known", "inserted silence"],
+  ];
+  document.getElementById("legend").innerHTML = items.map(
+    ([v, t]) => `<span><i class="sw" style="background:${css(v)}"></i>${t}</span>`).join("");
+}
+
+function renderStack() {
+  const w = Math.ceil(xOf(durationSec())) + 20, stack = document.getElementById("stack");
+  stack.style.width = LABEL_W + w + "px";
+  stack.innerHTML = "";
+  for (const t of TRACKS) {
+    const row = document.createElement("div"); row.className = "row";
+    row.innerHTML = `<div class="label"><b>${t.label}</b>${t.note}</div>`;
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = t.h; canvas.style.height = t.h + "px";
+    row.appendChild(canvas); stack.appendChild(row);
+    t.draw(canvas.getContext("2d"), w, t.h);
+  }
+  const overlay = document.createElement("div"); overlay.id = "overlay"; overlay.style.width = w + "px";
+  overlay.innerHTML = '<div id="selection"></div><div id="cursor"></div><div id="playhead"></div>';
+  stack.appendChild(overlay);
+  bindOverlay(overlay);
+  placeMarkers();
+}
+
+function placeMarkers() {
+  const cur = document.getElementById("cursor"), sel = document.getElementById("selection");
+  if (!cur) return;
+  cur.style.left = xOf(cursorSec) + "px";
+  if (selection) {
+    sel.style.display = "block";
+    sel.style.left = xOf(selection[0]) + "px";
+    sel.style.width = xOf(selection[1] - selection[0]) + "px";
+  } else sel.style.display = "none";
+}
+
+function bindOverlay(overlay) {
+  const sec = (e) => Math.max(0, Math.min(durationSec(), (e.clientX - overlay.getBoundingClientRect().left) / pxPerSec));
+  let anchor = null;
+  overlay.addEventListener("mousedown", (e) => { anchor = sec(e); cursorSec = anchor; selection = null; placeMarkers(); });
+  overlay.addEventListener("mousemove", (e) => {
+    const t = sec(e), f = Math.min(clip.probs.length - 1, Math.floor(t * D.rate_hz / D.frame_samples));
+    document.getElementById("readout").textContent =
+      `${fmt(t)}   p = ${clip.probs[f].toFixed(3)}   ${clip.probs[f] >= D.speech_threshold ? "speech" : clip.probs[f] < D.exit_threshold ? "quiet" : "between"}`;
+    if (anchor !== null && Math.abs(t - anchor) > 0.02) {
+      selection = [Math.min(anchor, t), Math.max(anchor, t)]; placeMarkers();
+    }
+  });
+  window.addEventListener("mouseup", () => { anchor = null; });
+}
+
+/* ---- playback ---- */
+function stop() {
+  if (source) { source.onended = null; try { source.stop(); } catch (e) { /* already stopped */ } }
+  playing = false; cancelAnimationFrame(raf);
+  document.getElementById("play").textContent = "Play";
+  const head = document.getElementById("playhead"); if (head) head.style.display = "none";
+}
+function play() {
+  if (playing) { stop(); return; }
+  audioCtx = audioCtx || new AudioContext();
+  const buffer = audioCtx.createBuffer(1, pcm.length, D.rate_hz);
+  buffer.copyToChannel(pcm, 0);
+  const from = selection ? selection[0] : cursorSec;
+  const to = selection ? selection[1] : durationSec();
+  source = audioCtx.createBufferSource(); source.buffer = buffer; source.connect(audioCtx.destination);
+  playOffset = from; playStart = audioCtx.currentTime;
+  source.start(0, from, Math.max(0.05, to - from));
+  source.onended = stop; playing = true;
+  document.getElementById("play").textContent = "Stop";
+  runHead();
+}
+
+function runHead() {
+  const head = document.getElementById("playhead"); head.style.display = "block";
+  const tick = () => {
+    const t = playOffset + (audioCtx.currentTime - playStart);
+    head.style.left = xOf(t) + "px";
+    const sc = document.getElementById("scroller");
+    const px = LABEL_W + xOf(t);
+    if (px > sc.scrollLeft + sc.clientWidth - 40) sc.scrollLeft = px - 160;
+    raf = requestAnimationFrame(tick);
+  };
+  tick();
+}
+
+function beep(when) {
+  const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+  osc.frequency.value = 880; gain.gain.value = 0.2;
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.start(when); osc.stop(when + 0.08);
+}
+
+/* Plays [from, to] once; a beep sounds at each mark; onEnd runs when the window ends. */
+function playWindow(from, to, marks, onEnd) {
+  stop();
+  audioCtx = audioCtx || new AudioContext();
+  const buffer = audioCtx.createBuffer(1, pcm.length, D.rate_hz);
+  buffer.copyToChannel(pcm, 0);
+  const start = Math.max(0, Math.min(durationSec() - 0.05, from));
+  const end = Math.max(start + 0.05, Math.min(durationSec(), to));
+  source = audioCtx.createBufferSource(); source.buffer = buffer; source.connect(audioCtx.destination);
+  playOffset = start; playStart = audioCtx.currentTime;
+  source.start(0, start, end - start);
+  for (const m of marks) if (m >= start && m <= end) beep(playStart + (m - start));
+  source.onended = () => { stop(); if (onEnd) onEnd(); };
+  playing = true;
+  document.getElementById("play").textContent = "Stop";
+  runHead();
+}
+
+/* ---- listen mode: pauses, cuts or chunks, one at a time ---- */
+const listen = { mode: "pauses", index: 0, repeat: false, all: false };
+function listenItems() {
+  if (!clip) return [];
+  if (listen.mode === "pauses") {
+    return clip.pauses.map((p) => {
+      const start = frameSec(p.start);
+      const outcome = p.cut !== null ? `cut at ${fmt(frameSec(p.cut))}` : "no cut";
+      return { from: start - 0.5, to: frameSec(p.end) + 0.5, marks: [start],
+               label: `pause ${Math.round(pauseMs(p))} ms at ${fmt(start)}, ${outcome}` };
+    });
+  }
+  if (listen.mode === "cuts") {
+    return clip.cuts.map((f) => ({ from: frameSec(f) - 1.5, to: frameSec(f) + 1.0,
+                                   marks: [frameSec(f)], label: `cut at ${fmt(frameSec(f))}` }));
+  }
+  // chunks: the audio the segmenter hands on, from one cut to the next
+  const cuts = clip.cuts.map(frameSec), ends = [...cuts, durationSec()];
+  return ends.map((end, i) => {
+    const begin = i === 0 ? 0 : cuts[i - 1];
+    return { from: begin, to: end + 0.2, marks: i < cuts.length ? [end] : [],
+             label: `chunk ${i + 1}: ${fmt(begin)} to ${fmt(end)}` };
+  });
+}
+function updateListen() {
+  const items = listenItems(), status = document.getElementById("listen-status");
+  status.textContent = items.length
+    ? `${listen.index + 1} of ${items.length}: ${items[listen.index].label}`
+    : "nothing to play in this mode";
+}
+function playItem(index, sequence = false) {
+  const items = listenItems();
+  if (!items.length) { updateListen(); return; }
+  listen.index = ((index % items.length) + items.length) % items.length;
+  listen.all = sequence;
+  const item = items[listen.index];
+  playWindow(item.from, item.to, item.marks, () => {
+    if (listen.all && listen.index + 1 < items.length) playItem(listen.index + 1, true);
+    else if (listen.repeat && !listen.all) playItem(listen.index);
+    else { listen.all = false; updateListen(); }
+  });
+  updateListen();
+}
+function setMode(mode) {
+  stop(); listen.mode = mode; listen.index = 0; listen.all = false;
+  document.querySelectorAll("#listen [data-mode]").forEach((b) =>
+    b.setAttribute("aria-pressed", String(b.dataset.mode === mode)));
+  updateListen();
+}
+
+/* ---- clip list, tables ---- */
+function nearest(list, startSec) {
+  let best = null;
+  for (const [a, b] of list) {
+    const d = secOfSample(a) - startSec;
+    if (best === null || Math.abs(d) < Math.abs(best.d)) best = { a, b, d };
+  }
+  return best;
+}
+/* What Smart Turn did inside one pause: its answers and whether it ended the chunk early. */
+function smartCell(p) {
+  if (!clip.turn) return "n/a";
+  const probes = clip.turn.probes.filter((q) => q.frame >= p.start && q.frame <= p.end);
+  if (!probes.length) return "not asked";
+  const best = Math.max(...probes.map((q) => q.p)).toFixed(2);
+  const cut = clip.turn.cuts.find((c) => c.frame >= p.start - 3 && c.frame <= p.end);
+  if (!cut) return `max p ${best}, ${probes.length} asked, no cut`;
+  const after = Math.round((cut.decided - p.start) * FRAME_MS);
+  if (cut.reason === "turn" || cut.reason === "soft") {
+    return `<span class="cut">${cut.reason} cut after ${after} ms</span> (max p ${best})`;
+  }
+  return `${cut.reason} cut after ${after} ms (max p ${best})`;
+}
+function renderTables() {
+  const synthetic = clip.known_pauses.length > 0;
+  const refName = synthetic ? "inserted silence" : "energy gap";
+  const refs = synthetic ? clip.known_pauses.map((k) => [k.start, k.end]) : clip.energy_runs;
+  document.getElementById("pause-head").innerHTML =
+    ["#", "start", "length", "segmenter", refName + " start", refName + " length", "start offset", "Smart Turn"]
+      .map((t) => `<th>${t}</th>`).join("");
+  const rows = clip.pauses.map((p, i) => {
+    const startSec = frameSec(p.start), ms = Math.round(pauseMs(p)), cut = p.cut !== null;
+    const near = nearest(refs, startSec);
+    const ok = near && Math.abs(near.d) <= 0.5; // the 500 ms tolerance of the endpointing evaluation
+    return `<tr data-t="${startSec}"><td>${i + 1}</td><td>${fmt(startSec)}</td><td>${ms} ms${p.open ? " (to end)" : ""}</td>` +
+      `<td class="${cut ? "cut" : ""}">${cut ? "cut" : (ms >= D.silence_ms ? "long, no cut" : "no cut")}</td>` +
+      (ok ? `<td>${fmt(secOfSample(near.a))}</td><td>${Math.round((near.b - near.a) * 1000 / D.rate_hz)} ms</td><td>${near.d >= 0 ? "-" : "+"}${Math.abs(Math.round(near.d * 1000))} ms</td>`
+          : `<td colspan="3">no matching reference</td>`) + `<td>${smartCell(p)}</td></tr>`;
+  });
+  const unseen = refs.filter(([a, b]) => !clip.pauses.some((p) =>
+    frameSec(p.start) < secOfSample(b) + 0.1 && frameSec(p.end) > secOfSample(a) - 0.1)).length;
+  const early = clip.turn ? clip.turn.cuts.filter((c) => c.reason === "turn" || c.reason === "soft").length : 0;
+  const smartNote = clip.turn ? ` Smart Turn would cut early ${early} times (${clip.turn.probes.length} model calls).` : "";
+  document.getElementById("summary").textContent = (refs.length
+    ? `${refs.length} ${refName}s; Silero found no pause overlapping ${unseen} of them. ` +
+      `${clip.pauses.length} pauses found, ${clip.cuts.length} segmenter cuts.`
+    : `No ${refName}s. ${clip.pauses.length} pauses found, ${clip.cuts.length} segmenter cuts.`) + smartNote;
+  document.getElementById("pause-body").innerHTML = rows.join("") ||
+    `<tr><td colspan="8">no pauses found</td></tr>`;
+  document.querySelectorAll("#pause-body tr[data-t]").forEach((tr) => tr.addEventListener("click", () => {
+    const t = parseFloat(tr.dataset.t); cursorSec = t; selection = [Math.max(0, t - 0.5), Math.min(durationSec(), t + 1.5)];
+    placeMarkers(); document.getElementById("scroller").scrollLeft = Math.max(0, xOf(t) - 120);
+  }));
+  document.getElementById("segs").innerHTML = clip.segments.map((s) =>
+    `<div class="seg" data-a="${secOfSample(s.start)}" data-b="${secOfSample(s.end)}"><small>${s.kind} - ${fmt(secOfSample(s.start))} to ${fmt(secOfSample(s.end))}</small><br>${s.text.replace(/</g, "&lt;")}</div>`).join("");
+  document.querySelectorAll(".seg").forEach((el) => el.addEventListener("click", () => {
+    selection = [parseFloat(el.dataset.a), parseFloat(el.dataset.b)]; cursorSec = selection[0]; placeMarkers();
+  }));
+}
+
+/* ---- comparison over all clips ----
+   Truth comes from the text labels: a pause after an "end" segment is a phrase end, any other
+   pause (after a "split" or "unfinished" segment, inside a real sentence, or a dip with no
+   segment) is inside a sentence, so a cut there is premature. */
+function pauseKind(c, p) {
+  if (c.kind === "real") return p.open ? "end" : "mid";
+  const at = frameSec(p.start);
+  const seg = c.segments.find((s) => Math.abs(secOfSample(s.end) - at) <= 0.5);
+  return seg && seg.kind === "end" ? "end" : "mid";
+}
+const pauseOfCut = (c, frame) => c.pauses.find((p) => frame >= p.start - 3 && frame <= p.end);
+function median(values) {
+  if (!values.length) return null;
+  const s = [...values].sort((a, b) => a - b), m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+function scoreModel(cutsOf, decidedMs) {
+  const r = { ends: 0, endsCut: 0, cuts: 0, hits: 0, premature: 0, waits: [] };
+  for (const c of D.clips) {
+    r.ends += c.kind === "real" ? 1 : c.segments.filter((s) => s.kind === "end").length;
+    const cutEnds = new Set();
+    for (const cut of cutsOf(c)) {
+      r.cuts++;
+      const p = pauseOfCut(c, cut.frame);
+      if (p && pauseKind(c, p) === "end") {
+        r.hits++; cutEnds.add(p);
+        const ms = decidedMs(c, cut, p); if (ms !== null) r.waits.push(ms);
+      } else r.premature++;
+    }
+    r.endsCut += cutEnds.size;
+  }
+  return r;
+}
+function renderCompare() {
+  const turnClips = D.clips.filter((c) => c.turn);
+  const fixed = scoreModel((c) => c.cuts.map((frame) => ({ frame })), () => null);
+  const smart = turnClips.length === D.clips.length
+    ? scoreModel((c) => c.turn.cuts, (c, cut, p) => Math.round((cut.decided - p.start) * FRAME_MS)) : null;
+  const pct = (a, b) => b ? Math.round(100 * a / b) + "%" : "n/a";
+  const wait = (r) => r && r.waits.length ? `${Math.round(median(r.waits))} ms (median)` : "n/a";
+  const real = D.clips.filter((c) => c.kind === "real").length;
+  document.getElementById("compare-note").textContent =
+    `${D.clips.length} clips (${real} real, ${D.clips.length - real} synthetic). Smart Turn runs on top of Silero: ` +
+    `it is asked during a Silero pause and may end the chunk before the ${D.silence_ms} ms timer. ` +
+    `A cut counts as right at a sentence end and premature inside a sentence.`;
+  document.getElementById("compare-head").innerHTML =
+    ["", "Silero timer (" + D.silence_ms + " ms)", "Silero + Smart Turn"].map((t) => `<th>${t}</th>`).join("");
+  const row = (name, f, s) => `<tr><td>${name}</td><td>${f}</td><td>${s}</td></tr>`;
+  const both = (fn) => [fn(fixed), smart ? fn(smart) : "n/a"];
+  document.getElementById("compare-body").innerHTML = [
+    row("Sentence ends found (recall)", ...both((r) => `${r.endsCut} of ${r.ends} (${pct(r.endsCut, r.ends)})`)),
+    row("Cuts at a sentence end", ...both((r) => String(r.hits))),
+    row("Cuts inside a sentence (premature)", ...both((r) => `${r.premature} (${pct(r.premature, r.cuts)} of cuts)`)),
+    row("Precision of cuts", ...both((r) => pct(r.hits, r.cuts))),
+    row("Wait after the pause starts, at a sentence end", "about " + Math.ceil(D.silence_ms / FRAME_MS) * FRAME_MS + " ms by design", wait(smart)),
+  ].join("");
+}
+
+function selectClip(index) {
+  stop(); clip = D.clips[index]; pcm = decode(clip.audio); cursorSec = 0; selection = null;
+  document.querySelectorAll("#clips button").forEach((b, i) => b.setAttribute("aria-current", String(i === index)));
+  fit(); renderLegend(); renderTables();
+  listen.index = 0; listen.all = false; updateListen();
+}
+function fit() {
+  const avail = document.getElementById("scroller").clientWidth - LABEL_W - 30;
+  pxPerSec = Math.max(20, Math.min(600, avail / durationSec())); renderStack();
+}
+function zoom(factor) {
+  const sc = document.getElementById("scroller"), centre = (sc.scrollLeft + sc.clientWidth / 2 - LABEL_W) / pxPerSec;
+  pxPerSec = Math.max(20, Math.min(600, pxPerSec * factor)); renderStack();
+  sc.scrollLeft = Math.max(0, centre * pxPerSec - sc.clientWidth / 2 + LABEL_W);
+}
+
+document.getElementById("clips").innerHTML = D.clips.map((c, i) =>
+  `<button data-i="${i}">${c.title}<br><span class="badge">${c.kind} - ${(c.samples / D.rate_hz).toFixed(1)} s - ${c.pauses.length} pauses - ${c.cuts.length} cuts</span></button>`).join("");
+document.querySelectorAll("#clips button").forEach((b) => b.addEventListener("click", () => selectClip(+b.dataset.i)));
+document.getElementById("play").addEventListener("click", play);
+document.querySelectorAll("#listen [data-mode]").forEach((b) => b.addEventListener("click", () => setMode(b.dataset.mode)));
+document.getElementById("prev").addEventListener("click", () => playItem(listen.index - 1));
+document.getElementById("next").addEventListener("click", () => playItem(listen.index + 1));
+document.getElementById("play-item").addEventListener("click", () => playItem(listen.index));
+document.getElementById("play-all").addEventListener("click", () => playItem(listen.index, true));
+document.getElementById("repeat").addEventListener("change", (e) => { listen.repeat = e.target.checked; });
+document.getElementById("zoom-in").addEventListener("click", () => zoom(1.5));
+document.getElementById("zoom-out").addEventListener("click", () => zoom(1 / 1.5));
+document.getElementById("fit").addEventListener("click", fit);
+document.getElementById("scroller").addEventListener("wheel", (e) => {
+  if (e.ctrlKey) { e.preventDefault(); zoom(e.deltaY < 0 ? 1.2 : 1 / 1.2); }
+}, { passive: false });
+window.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || !clip) return;
+  if (e.code === "Space") { e.preventDefault(); play(); }
+  if (e.code === "ArrowRight") { e.preventDefault(); playItem(listen.index + 1); }
+  if (e.code === "ArrowLeft") { e.preventDefault(); playItem(listen.index - 1); }
+});
+window.addEventListener("resize", () => { if (clip) fit(); });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (clip) { renderLegend(); renderStack(); } });
+renderCompare();
+selectClip(0);
+</script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Downloaded models (fetched by scripts/fetch_models.py, never committed)
+models/
+
+# Downloaded evaluation data, LibriSpeech and LibriSpeech-PC (CC BY 4.0; fetched by
+# scripts/fetch_models.py --with-data, extracted by scripts/eval_endpointing.py, never committed)
+data/
+
+# Process Monitor captures from the disk-I/O check
+*.pml
+procmon/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+*.stackdump
+
+# Local Claude settings
+.claude/settings.local.json
+
+# visual brainstorming sessions (contain chat text)
+.superpowers/
