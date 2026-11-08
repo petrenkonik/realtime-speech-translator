@@ -56,12 +56,16 @@ Both must print nothing for the whole run.
 Disk (A1), Sysinternals Process Monitor:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/procmon_check.ps1 -Minutes 60
+# elevated shell; the pid is printed by scripts/soak.py
+powershell -ExecutionPolicy Bypass -File scripts/procmon_check.ps1 -ProcessId 1234 -Minutes 60
 ```
 
 The script starts `Procmon.exe /AcceptEula /Quiet /Minimized /BackingFile`,
 stops it with `/Terminate`, exports CSV and filters by the demo PID for
-`WriteFile` and write-mode `CreateFile`. Expected result: 0 events.
+`WriteFile`, write-mode `CreateFile`, delete, rename and truncate on drive paths.
+Expected result: `disk_writes=0 -> PASS`. Registry writes are listed for
+information only. Needs Process Monitor (Sysinternals) and an elevated shell;
+ask the user to download and run it, never do either yourself.
 The capture file is written by Process Monitor, not the demo, and is ignored
 by git (`*.pml`).
 
